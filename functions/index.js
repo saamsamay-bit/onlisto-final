@@ -136,29 +136,8 @@ async function importOneOrder(account, o) {
     .where('onbuyOrderId', '==', onbuyOrderId)
     .limit(1)
     .get();
-  
   if (!existing.empty) {
-    const existingDoc = existing.docs[0];
-    const existingData = existingDoc.data();
-    
-    // Check if order status changed on OnBuy (e.g. dispatched via OnBuy directly)
-    const onbuyStatus = (o.status || '').toLowerCase();
-    const isNowDispatched = onbuyStatus.includes('dispatch') || onbuyStatus.includes('shipped') || onbuyStatus.includes('complete');
-    const wasAlreadyDispatched = existingData.dispatchedToOnbuy === true || existingData.status === 'Dispatched';
-    
-    if (isNowDispatched && !wasAlreadyDispatched) {
-      await existingDoc.ref.update({
-        dispatchedToOnbuy: true,
-        status: 'Dispatched',
-        trackingNumber: o.tracking_number || o.trackingNumber || existingData.trackingNumber || '',
-        trackingCarrier: o.tracking_carrier || o.trackingCarrier || existingData.trackingCarrier || '',
-        dispatchedAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastSyncFromOnBuy: admin.firestore.FieldValue.serverTimestamp()
-      });
-      logger.info(`${account.name}: order ${onbuyOrderId} updated — now dispatched on OnBuy.`);
-    } else {
-      logger.info(`${account.name}: order ${onbuyOrderId} already imported, no status change.`);
-    }
+    logger.info(`${account.name}: order ${onbuyOrderId} already imported, skipping.`);
     return;
   }
 
@@ -503,106 +482,115 @@ exports.migrateData = onRequest({cors: true}, async (req, res) => {
   }
 });
 // ============================================
-// LIVE DATA EXPORT — CLEAN VERSION
+// FIXED pullOnBuyOrders — bulletproof deduplication
 // ============================================
-exports.getLiveData = onRequest({cors: true}, async (req, res) => {
+exports.pullOnBuyOrders = onRequest({timeoutSeconds: 300, memory: "1GiB"}, async (req, res) => {
+  const { logger } = require("firebase-functions");
   const db = admin.firestore();
-  const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const now = admin.firestore.Timestamp.now();
   
   try {
-    const allOrdersSnap = await db.collection('orderTracker_orders').get();
-    let totalOrders = 0, totalSales = 0, totalProfit = 0;
-    let todayOrders = 0, todaySales = 0, todayProfit = 0;
-    let monthOrders = 0, monthSales = 0, monthProfit = 0;
-    let pendingDispatch = 0, stalePending = 0;
-    let panaceaPending = 0, samayyPending = 0;
-    const itemMap = {};
+    const orgSnap = await db.collection("orderTracker_orgs").get();
+    if (orgSnap.empty) { return res.json({ imported: 0, message: "No orgs configured" }); }
     
-    allOrdersSnap.forEach(doc => {
-      const o = doc.data();
-      const sale = Number(o.sellingPrice) || 0;
-      const fee = Number(o.onbuyFee) || 0;
-      const cost = Number(o.amount) || 0;
-      const profit = sale - fee - cost;
-      const created = o.createdAt ? o.createdAt.toDate() : null;
-      const itemName = String(o.item || 'Unknown').trim();
-      const isDispatched = o.dispatchedToOnbuy === true || o.status === 'Dispatched';
-      const acc = (o.account || '').toLowerCase();
+    let totalImported = 0, totalUpdated = 0, totalSkipped = 0;
+    
+    for (const orgDoc of orgSnap.docs) {
+      const ORG_ID = orgDoc.id;
+      const account = orgDoc.data();
       
-      totalOrders++; totalSales += sale; totalProfit += profit;
+      if (!account.onbuyApiKey) { logger.info(account.name + ": no API key"); continue; }
       
-      if (!isDispatched) {
-        if (created && created >= weekStart) {
-          pendingDispatch++;
-          if (acc.includes('panacea')) panaceaPending++;
-          else if (acc.includes('samay')) samayyPending++;
+      const orders = await fetchOnBuyOrders(account.onbuyApiKey, account);
+      logger.info(account.name + ": fetched " + orders.length + " orders from OnBuy");
+      
+      for (const o of orders) {
+        const onbuyOrderId = o.order_number || o.id || o.order_id;
+        if (!onbuyOrderId) { logger.warn("Skipping order with no ID"); continue; }
+        
+        const docId = "onbuy_" + String(onbuyOrderId).replace(/[^a-zA-Z0-9_-]/g, "_");
+        const docRef = db.collection("orderTracker_orders").doc(docId);
+        const docSnap = await docRef.get();
+        
+        const orderData = {
+          onbuyOrderId: String(onbuyOrderId),
+          orgId: ORG_ID,
+          account: account.name || "Unknown",
+          team: account.teamLabel || (String(account.name).toLowerCase().includes("panacea") ? "panacea" : "samayy"),
+          item: o.product_title || o.item_name || o.title || "Unknown",
+          sku: o.sku || o.product_sku || "",
+          opc: o.opc || o.product_id || "",
+          sellingPrice: Number(o.total || o.price || o.amount || 0),
+          onbuyFee: Number(o.fee || o.commission || 0),
+          amount: Number(o.cost || o.source_price || 0),
+          quantity: Number(o.quantity || o.qty || 1),
+          buyerName: o.buyer_name || o.customer_name || o.name || "",
+          buyerEmail: o.buyer_email || o.email || "",
+          buyerPhone: o.buyer_phone || o.phone || o.telephone || "",
+          buyerAddress: o.buyer_address || o.address || o.shipping_address || "",
+          buyerPostcode: o.buyer_postcode || o.postcode || o.zip || "",
+          status: o.status || "Placed",
+          trackingNumber: o.tracking_number || o.trackingNumber || "",
+          trackingCarrier: o.tracking_carrier || o.trackingCarrier || "",
+          dispatchedToOnbuy: (o.status || "").toLowerCase().includes("dispatch") || (o.status || "").toLowerCase().includes("shipped"),
+          createdAt: o.created_at ? admin.firestore.Timestamp.fromDate(new Date(o.created_at)) : now,
+          updatedAt: now,
+          lastSyncFromOnBuy: now
+        };
+        
+        if (docSnap.exists) {
+          const existing = docSnap.data();
+          const changes = {};
+          const historyEntry = { timestamp: now, action: "sync_update", fields: [] };
+          
+          const fieldsToCheck = ["status", "trackingNumber", "trackingCarrier", "dispatchedToOnbuy", "buyerPhone", "buyerAddress"];
+          for (const field of fieldsToCheck) {
+            const oldVal = existing[field];
+            const newVal = orderData[field];
+            if (oldVal !== newVal && !(oldVal == null && newVal == null)) {
+              changes[field] = newVal;
+              historyEntry.fields.push({ field: field, from: oldVal, to: newVal });
+            }
+          }
+          
+          const wasDispatched = existing.dispatchedToOnbuy === true;
+          const nowShowsUndispatched = !orderData.dispatchedToOnbuy && (existing.status || "").toLowerCase().includes("dispatch");
+          if (wasDispatched && nowShowsUndispatched) {
+            historyEntry.glitchWarning = "OnBuy shows undispatched after dispatch — MANUAL REVIEW NEEDED";
+            historyEntry.fields.push({ field: "status", from: existing.status, to: orderData.status, note: "GLITCH" });
+            delete changes.dispatchedToOnbuy;
+            delete changes.status;
+          }
+          
+          if (historyEntry.fields.length > 0) {
+            changes.syncHistory = admin.firestore.FieldValue.arrayUnion(historyEntry);
+            changes.updatedAt = now;
+            changes.lastSyncFromOnBuy = now;
+            await docRef.update(changes);
+            totalUpdated++;
+            logger.info(account.name + ": order " + onbuyOrderId + " updated");
+          } else {
+            totalSkipped++;
+            logger.info(account.name + ": order " + onbuyOrderId + " — no changes");
+          }
         } else {
-          stalePending++;
+          orderData.syncHistory = [{ timestamp: now, action: "created", source: "pullOnBuyOrders" }];
+          await docRef.set(orderData);
+          totalImported++;
+          logger.info(account.name + ": order " + onbuyOrderId + " CREATED");
         }
       }
-      
-      if (created) {
-        if (created >= todayStart) { todayOrders++; todaySales += sale; todayProfit += profit; }
-        if (created >= monthStart) { monthOrders++; monthSales += sale; monthProfit += profit; }
-      }
-      
-      if (itemName) {
-        if (!itemMap[itemName]) itemMap[itemName] = { qty: 0, revenue: 0, profit: 0 };
-        itemMap[itemName].qty += Number(o.quantity) || 1;
-        itemMap[itemName].revenue += sale;
-        itemMap[itemName].profit += profit;
-      }
-    });
+    }
     
-    const topItems = Object.entries(itemMap)
-      .map(([name, v]) => ({ name, ...v }))
-      .sort((a, b) => b.profit - a.profit)
-      .slice(0, 10)
-      .map(x => ({ name: x.name, qty: x.qty, revenue: Math.round(x.revenue * 100) / 100, profit: Math.round(x.profit * 100) / 100 }));
-    
-    const disSnap = await db.collection('orderTracker_disputes').get();
-    let disUrgent = 0, disOpen = 0, disWaiting = 0, disResolved = 0;
-    
-    disSnap.forEach(doc => {
-      const d = doc.data();
-      const status = d.status || 'Open';
-      const dl = d.deadline ? d.deadline.toDate() : null;
-      const isUrgent = dl && status !== 'Resolved' && status !== 'Closed' && (dl - now) < 24 * 3600000;
-      
-      if (isUrgent) disUrgent++;
-      if (status === 'Open') disOpen++;
-      else if (status === 'Replied' || status === 'Escalated') disWaiting++;
-      else disResolved++;
-    });
-    
-    const listSnap = await db.collection('orderTracker_listings').get();
-    let activeListings = 0, deadListings = 0, flaggedListings = 0, winningBB = 0, losingBB = 0;
-    
-    listSnap.forEach(doc => {
-      const l = doc.data();
-      if (l.status === 'out_of_stock' || l.quantity === 0) deadListings++;
-      else activeListings++;
-      if (l.brandFlagged === true) flaggedListings++;
-      if (l.winningBuyBox === true && l.status !== 'out_of_stock') winningBB++;
-      if (l.winningBuyBox === false && l.status !== 'out_of_stock') losingBB++;
-    });
-    
-    res.json({
-      timestamp: now.toISOString(),
-      orders: {
-        total: totalOrders, totalSales: Math.round(totalSales * 100) / 100, totalProfit: Math.round(totalProfit * 100) / 100,
-        pendingDispatch: { recent: pendingDispatch, stale: stalePending, panacea: panaceaPending, samayy: samayyPending },
-        today: { count: todayOrders, sales: Math.round(todaySales * 100) / 100, profit: Math.round(todayProfit * 100) / 100 },
-        thisMonth: { count: monthOrders, sales: Math.round(monthSales * 100) / 100, profit: Math.round(monthProfit * 100) / 100 },
-        topItems
-      },
-      disputes: { urgent: disUrgent, open: disOpen, waiting: disWaiting, resolved: disResolved },
-      catalog: { total: listSnap.size, active: activeListings, dead: deadListings, flagged: flaggedListings, winningBuyBox: winningBB, losingBuyBox: losingBB }
+    res.json({ 
+      success: true, 
+      imported: totalImported, 
+      updated: totalUpdated, 
+      skipped: totalSkipped,
+      message: "Sync complete: " + totalImported + " new, " + totalUpdated + " updated, " + totalSkipped + " unchanged"
     });
   } catch (e) {
+    logger.error("pullOnBuyOrders error:", e);
     res.status(500).json({ error: e.message });
   }
 });
