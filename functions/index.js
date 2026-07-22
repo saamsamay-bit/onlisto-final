@@ -1,15 +1,17 @@
-﻿/**
- * TokAxis OnBuy integration â€” Cloud Functions
+﻿const axios = require('axios');
+const cheerio = require('cheerio');
+/**
+ * TokAxis OnBuy integration Ã¢â‚¬â€ Cloud Functions
  * ============================================
  * Two jobs:
- *  1. pullOnBuyOrders   â€” runs every 15 min, pulls new orders from both OnBuy
+ *  1. pullOnBuyOrders   Ã¢â‚¬â€ runs every 15 min, pulls new orders from both OnBuy
  *                         accounts (Panacea, Samayy), writes them into the
  *                         same Firestore collection the dashboard reads from.
- *  2. pushTrackingToOnBuy â€” fires instantly whenever a VA/admin adds tracking
+ *  2. pushTrackingToOnBuy Ã¢â‚¬â€ fires instantly whenever a VA/admin adds tracking
  *                         info to an order, sends it back to OnBuy via the
  *                         correct account's API keys.
  *
- * IMPORTANT â€” before deploying, read the "CONFIRM WITH ONBUY" notes below.
+ * IMPORTANT Ã¢â‚¬â€ before deploying, read the "CONFIRM WITH ONBUY" notes below.
  * OnBuy's docs are an interactive Postman collection; a couple of exact
  * field names (the dispatch payload, courier name list) should be checked
  * against your own account's Postman collection / API page before going
@@ -21,6 +23,7 @@ const { onSchedule } = require('firebase-functions/v2/scheduler');
 const { onDocumentUpdated } = require('firebase-functions/v2/firestore');
 const { defineSecret } = require('firebase-functions/params');
 const logger = require('firebase-functions/logger');
+const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const fetch = require('node-fetch');
 
@@ -28,14 +31,14 @@ admin.initializeApp();
 const db = admin.firestore();
 
 // ---------------------------------------------------------------------------
-// CONFIG â€” the one org this runs for right now (Panceaa). If you ever add a
+// CONFIG Ã¢â‚¬â€ the one org this runs for right now (Panceaa). If you ever add a
 // second client org to the dashboard, this becomes a loop over orgs instead.
 // ---------------------------------------------------------------------------
-const ORG_ID = 'LfCP6mxaSP0WHclScUQC'; // Panceaa â€” note the zero, not the letter O
+const ORG_ID = 'LfCP6mxaSP0WHclScUQC'; // Panceaa Ã¢â‚¬â€ note the zero, not the letter O
 
 // Each OnBuy account gets its own secret pair, stored in Secret Manager
 // (never hardcoded, never committed to git). "team" is the VA name this
-// account maps to in the dashboard â€” change if your VA/account pairing
+// account maps to in the dashboard Ã¢â‚¬â€ change if your VA/account pairing
 // isn't a simple 1-to-1 match.
 const ACCOUNTS = [
   {
@@ -55,7 +58,7 @@ const ACCOUNTS = [
 const ONBUY_BASE = 'https://api.onbuy.com/v2';
 
 // ---------------------------------------------------------------------------
-// AUTH â€” get a fresh 15-minute access token for one account.
+// AUTH Ã¢â‚¬â€ get a fresh 15-minute access token for one account.
 // ---------------------------------------------------------------------------
 async function getOnBuyToken(consumerKey, secretKey) {
   const res = await fetch(`${ONBUY_BASE}/auth/request_token`, {
@@ -71,9 +74,9 @@ async function getOnBuyToken(consumerKey, secretKey) {
 }
 
 // ---------------------------------------------------------------------------
-// JOB 1 â€” pull new orders in, every 15 minutes.
+// JOB 1 Ã¢â‚¬â€ pull new orders in, every 15 minutes.
 // ---------------------------------------------------------------------------
-exports.pullOnBuyOrders = onSchedule(
+exports.scheduledPullOnBuyOrders = onSchedule(
   {
     schedule: 'every 15 minutes',
     secrets: ACCOUNTS.flatMap(a => [a.consumerKey, a.secretKey]),
@@ -96,11 +99,11 @@ async function pullOrdersForAccount(account) {
   const secretKey = account.secretKey.value();
   const token = await getOnBuyToken(consumerKey, secretKey);
 
-  // filter[status]=awaiting_dispatch â€” only pull orders that still need
+  // filter[status]=awaiting_dispatch Ã¢â‚¬â€ only pull orders that still need
   // sourcing/dispatching, not ones already completed long ago.
-  // filter[previously_exported]=0 â€” OnBuy tracks per-integration whether an
+  // filter[previously_exported]=0 Ã¢â‚¬â€ OnBuy tracks per-integration whether an
   // order has already been fetched, so this alone should stop duplicates
-  // arriving from OnBuy's side â€” we ALSO double-check against our own
+  // arriving from OnBuy's side Ã¢â‚¬â€ we ALSO double-check against our own
   // database below, belt-and-braces.
 const url = `${ONBUY_BASE}/orders?site_id=2000&filter[status]=awaiting_dispatch&filter[previously_exported]=0&sort[created]=asc`;  const res = await fetch(url, { headers: { Authorization: token } });
   const json = await res.json();
@@ -121,7 +124,7 @@ async function importOneOrder(account, o) {
   // CONFIRM WITH ONBUY: field names below (order_id, sku, price, etc.) are
   // based on OnBuy's published examples. Double-check the exact shape of
   // one real order response in Postman before relying on this in production
-  // â€” marketplace order payloads sometimes nest items under a "products"
+  // Ã¢â‚¬â€ marketplace order payloads sometimes nest items under a "products"
   // array rather than flat fields.
   const onbuyOrderId = o.order_id || o.id;
   if (!onbuyOrderId) {
@@ -129,7 +132,7 @@ async function importOneOrder(account, o) {
     return;
   }
 
-  // Dedupe check â€” never import the same OnBuy order number twice, same
+  // Dedupe check Ã¢â‚¬â€ never import the same OnBuy order number twice, same
   // safeguard as the manual entry form already has.
   const existing = await db.collection('orderTracker_orders')
     .where('orgId', '==', ORG_ID)
@@ -147,14 +150,14 @@ async function importOneOrder(account, o) {
     orgId: ORG_ID,
     team: account.team,
     account: account.name,
-    platform: '',            // VA still needs to fill this in â€” where they sourced it
+    platform: '',            // VA still needs to fill this in Ã¢â‚¬â€ where they sourced it
     orderNo: onbuyOrderId,
     onbuyOrderId,
     sku: item.sku || '',
     sourceOrderNo: '',       // VA fills this in once they've bought it
     sourceLink: '',          // VA fills this in once they've bought it
     item: item.title || item.name || 'Imported from OnBuy',
-    amount: 0,               // sourcing cost â€” VA fills this in
+    amount: 0,               // sourcing cost Ã¢â‚¬â€ VA fills this in
     notes: '',
     qty: item.quantity || 1,
     sellingPrice: parseFloat(o.total || item.price || 0),
@@ -177,7 +180,7 @@ async function importOneOrder(account, o) {
 }
 
 // ---------------------------------------------------------------------------
-// JOB 3 â€” monitor live listings (price, stock, active/inactive), every 15 min.
+// JOB 3 Ã¢â‚¬â€ monitor live listings (price, stock, active/inactive), every 15 min.
 // Writes into a separate collection so it doesn't interfere with orders.
 // ---------------------------------------------------------------------------
 exports.pullOnBuyListings = onSchedule(
@@ -201,12 +204,12 @@ async function pullListingsForAccount(account) {
   const token = await getOnBuyToken(account.consumerKey.value(), account.secretKey.value());
 
   // Field names below are confirmed against a real OnBuy listings CSV export
-  // (16,252 real rows checked on 6 Jul 2026) â€” sku, price, stock, opc,
+  // (16,252 real rows checked on 6 Jul 2026) Ã¢â‚¬â€ sku, price, stock, opc,
   // product_title, suspended_reason, winning_status, lead_listing_price all
   // matched real data. The live JSON API response *should* use the same
   // names since CSV exports and API responses are normally generated from
   // the same underlying fields, but if the first live run comes back empty
-  // or odd, check the Logs tab â€” that's the one thing still worth a 2-minute
+  // or odd, check the Logs tab Ã¢â‚¬â€ that's the one thing still worth a 2-minute
   // sanity check on a real API call before trusting this fully.
   const url = `${ONBUY_BASE}/listings?site_id=2000&country_code=GB`;
   const res = await fetch(url, { headers: { Authorization: token } });
@@ -218,7 +221,7 @@ async function pullListingsForAccount(account) {
   const now = admin.firestore.FieldValue.serverTimestamp();
 
   for (const l of listings) {
-    // Confirmed against a real OnBuy listings export on 6 Jul 2026 â€” these
+    // Confirmed against a real OnBuy listings export on 6 Jul 2026 Ã¢â‚¬â€ these
     // are the real field names, not guesses.
     const docId = `${account.name}_${l.sku || l.opc}`;
     const ref = db.collection('orderTracker_listings').doc(docId);
@@ -228,7 +231,7 @@ async function pullListingsForAccount(account) {
     const competingPrice = parseFloat(l.lead_listing_price || l.winning_price || 0);
     const winningBuyBox = l.winning_status === '1';
 
-    // Suggest-only for now â€” does NOT touch the live OnBuy price. See the
+    // Suggest-only for now Ã¢â‚¬â€ does NOT touch the live OnBuy price. See the
     // pending floor-price decision before this becomes an actual auto-push.
     const canWinByRepricing = !winningBuyBox && stock > 0 && competingPrice > 0 && competingPrice < price;
     const suggestedPrice = canWinByRepricing ? Math.max(0.01, competingPrice - 0.01) : null;
@@ -259,17 +262,17 @@ async function pullListingsForAccount(account) {
 
 
 // ---------------------------------------------------------------------------
-// JOB 4 â€” auto-reprice to win the buy box, but never below a safe floor.
+// JOB 4 Ã¢â‚¬â€ auto-reprice to win the buy box, but never below a safe floor.
 //
-// Floor = (most recent sourcing cost logged for that SKU Ã— (1 + your margin%))
-//         Ã· (1 âˆ’ OnBuy's actual observed fee rate on that SKU's last sale)
+// Floor = (most recent sourcing cost logged for that SKU Ãƒâ€” (1 + your margin%))
+//         ÃƒÂ· (1 Ã¢Ë†â€™ OnBuy's actual observed fee rate on that SKU's last sale)
 //
 // Using your OWN last logged order's real fee (rather than guessing OnBuy's
 // tiered fee table) means the floor reflects what OnBuy actually took last
 // time, not a theoretical rate.
 //
 // If a SKU has never been logged with a cost, or the competing price is
-// below what your floor allows, nothing gets pushed â€” it's left flagged in
+// below what your floor allows, nothing gets pushed Ã¢â‚¬â€ it's left flagged in
 // Firestore for you to look at, never silently undercut.
 // ---------------------------------------------------------------------------
 const DEFAULT_MARGIN_PERCENT = 15; // used only if the org doc has no override
@@ -298,7 +301,7 @@ async function getMostRecentCostAndFeeRate(sku) {
 
 function calcFloor(cost, feeRate, marginPercent) {
   const denom = 1 - feeRate;
-  if (denom <= 0) return null; // fee rate of 100%+ makes this unsolvable â€” flag, don't guess
+  if (denom <= 0) return null; // fee rate of 100%+ makes this unsolvable Ã¢â‚¬â€ flag, don't guess
   return (cost * (1 + marginPercent / 100)) / denom;
 }
 
@@ -340,7 +343,7 @@ exports.repriceToWinBuyBox = onSchedule(
       }
 
       if (l.suggestedRepriceTo < floor) {
-        // Winning the buy box here would mean selling at a loss â€” skip.
+        // Winning the buy box here would mean selling at a loss Ã¢â‚¬â€ skip.
         await doc.ref.update({
           repriceStatus: 'below_floor_skipped',
           calculatedFloor: Math.round(floor * 100) / 100,
@@ -360,7 +363,7 @@ exports.repriceToWinBuyBox = onSchedule(
 
       try {
         const token = await getOnBuyToken(account.consumerKey.value(), account.secretKey.value());
-        // CONFIRM WITH ONBUY: exact body shape for PUT /v2/listings/by-sku â€”
+        // CONFIRM WITH ONBUY: exact body shape for PUT /v2/listings/by-sku Ã¢â‚¬â€
         // taken from the docs' description, not a tested real response.
         const res = await fetch(`${ONBUY_BASE}/listings/by-sku`, {
           method: 'PUT',
@@ -380,7 +383,7 @@ exports.repriceToWinBuyBox = onSchedule(
         }
         logger.info(`${accountName}: repriced ${items.length} listing(s).`);
       } catch (e) {
-        logger.error(`${accountName}: reprice push failed â€” ${e.message}`);
+        logger.error(`${accountName}: reprice push failed Ã¢â‚¬â€ ${e.message}`);
       }
     }
   }
@@ -482,7 +485,7 @@ exports.migrateData = onRequest({cors: true}, async (req, res) => {
   }
 });
 // ============================================
-// FIXED pullOnBuyOrders — bulletproof deduplication
+// FIXED pullOnBuyOrders â€” bulletproof deduplication
 // ============================================
 exports.pullOnBuyOrders = onRequest({timeoutSeconds: 300, memory: "1GiB"}, async (req, res) => {
   const { logger } = require("firebase-functions");
@@ -556,7 +559,7 @@ exports.pullOnBuyOrders = onRequest({timeoutSeconds: 300, memory: "1GiB"}, async
           const wasDispatched = existing.dispatchedToOnbuy === true;
           const nowShowsUndispatched = !orderData.dispatchedToOnbuy && (existing.status || "").toLowerCase().includes("dispatch");
           if (wasDispatched && nowShowsUndispatched) {
-            historyEntry.glitchWarning = "OnBuy shows undispatched after dispatch — MANUAL REVIEW NEEDED";
+            historyEntry.glitchWarning = "OnBuy shows undispatched after dispatch â€” MANUAL REVIEW NEEDED";
             historyEntry.fields.push({ field: "status", from: existing.status, to: orderData.status, note: "GLITCH" });
             delete changes.dispatchedToOnbuy;
             delete changes.status;
@@ -571,7 +574,7 @@ exports.pullOnBuyOrders = onRequest({timeoutSeconds: 300, memory: "1GiB"}, async
             logger.info(account.name + ": order " + onbuyOrderId + " updated");
           } else {
             totalSkipped++;
-            logger.info(account.name + ": order " + onbuyOrderId + " — no changes");
+            logger.info(account.name + ": order " + onbuyOrderId + " â€” no changes");
           }
         } else {
           orderData.syncHistory = [{ timestamp: now, action: "created", source: "pullOnBuyOrders" }];
@@ -594,3 +597,191 @@ exports.pullOnBuyOrders = onRequest({timeoutSeconds: 300, memory: "1GiB"}, async
     res.status(500).json({ error: e.message });
   }
 });
+
+
+// ============================================
+// SCRAPINGBEE PRICE CHECKER
+// ============================================
+const getScrapingBeeKey = () => {
+  try { return functions.config().scrapingbee.key; }
+  catch (e) { return process.env.SCRAPINGBEE_API_KEY || ''; }
+};
+
+const buildScrapingBeeUrl = (targetUrl) => {
+  const apiKey = getScrapingBeeKey();
+  return `https://app.scrapingbee.com/api/v1/?api_key=${apiKey}&url=${encodeURIComponent(targetUrl)}&render_js=true&premium_proxy=true&country_code=gb`;
+};
+
+const extractPrices = (html, platform) => {
+  const $ = cheerio.load(html);
+  const results = [];
+  const selector = platform === 'amazon' ? '.a-price .a-offscreen' :
+                   platform === 'ebay' ? '.s-item__price' : '[class*="price"]';
+
+  $(selector).each((i, el) => {
+    if (i >= 3) return;
+    const text = $(el).text().trim();
+    const match = text.match(/Â£?\s*([\d,]+\.?\d{0,2})/);
+    if (match) {
+      const price = parseFloat(match[1].replace(/,/g, ''));
+      if (price > 0 && price < 10000) {
+        results.push({
+          platform: platform === 'amazon' ? 'Amazon UK' : platform === 'ebay' ? 'eBay UK' : 'AliExpress',
+          price: price,
+          currency: 'GBP',
+          title: platform + ' result ' + (i + 1),
+          link: platform === 'amazon' ? 'https://www.amazon.co.uk' : platform === 'ebay' ? 'https://www.ebay.co.uk' : 'https://www.aliexpress.com'
+        });
+      }
+    }
+  });
+  return results.slice(0, 2);
+};
+
+// Check source price — supports TWO modes:
+// Mode 1: sourceUrl provided → scrape ONE link (1 API call)
+// Mode 2: query provided → search Amazon/eBay/AliExpress (3 API calls)
+exports.checkSourcePrices = onRequest({cors: true}, async (req, res) => {
+  if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
+
+  const sourceUrl = req.query.sourceUrl || req.body?.sourceUrl;
+  const query = req.query.query || req.query.sku || req.body?.query;
+  const listingId = req.query.listingId || req.body?.listingId;
+  const saveToFirestore = (req.query.saveToFirestore === 'true') || (req.body?.saveToFirestore === true);
+
+  const apiKey = getScrapingBeeKey();
+  if (!apiKey) { res.status(500).json({ error: 'ScrapingBee API key not configured' }); return; }
+
+  try {
+    let response = {};
+
+    // === MODE 1: Direct URL scrape (1 API call) ===
+    if (sourceUrl) {
+      const sbUrl = `https://app.scrapingbee.com/api/v1?api_key=${apiKey}&url=${encodeURIComponent(sourceUrl)}&render_js=true&premium_proxy=true&country_code=gb`;
+      const r = await axios.get(sbUrl, { timeout: 45000 });
+      const extracted = extractSinglePrice(r.data, sourceUrl);
+
+      response = {
+        success: true,
+        mode: 'direct_url',
+        sourceUrl: sourceUrl,
+        price: extracted.price,
+        title: extracted.title,
+        inStock: extracted.inStock,
+        scrapedAt: new Date().toISOString()
+      };
+
+      // Save to Firestore if requested
+      if (saveToFirestore && listingId) {
+        await db.collection('orderTracker_listings').doc(listingId).update({
+          sourcePrice: extracted.price,
+          sourceTitle: extracted.title,
+          sourceInStock: extracted.inStock,
+          sourceCheckedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        response.saved = true;
+      }
+
+      return res.json(response);
+    }
+
+    // === MODE 2: Search across platforms (3 API calls) ===
+    if (!query) {
+      return res.status(400).json({
+        error: 'Missing parameters. Send either sourceUrl (1 API call) or query (3 API calls)',
+        examples: {
+          direct: '/checkSourcePrices?sourceUrl=https://amazon.co.uk/dp/...&listingId=ABC',
+          search: '/checkSourcePrices?query=iphone+15+case&listingId=ABC&saveToFirestore=true'
+        }
+      });
+    }
+
+    const urls = {
+      amazon: `https://www.amazon.co.uk/s?k=${encodeURIComponent(query)}`,
+      ebay: `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(query)}`,
+      aliexpress: `https://www.aliexpress.com/wholesale?SearchText=${encodeURIComponent(query)}`
+    };
+
+    const results = await Promise.allSettled([
+      axios.get(buildScrapingBeeUrl(urls.amazon), { timeout: 45000 }).then(r => extractPrices(r.data, 'amazon')),
+      axios.get(buildScrapingBeeUrl(urls.ebay), { timeout: 45000 }).then(r => extractPrices(r.data, 'ebay')),
+      axios.get(buildScrapingBeeUrl(urls.aliexpress), { timeout: 45000 }).then(r => extractPrices(r.data, 'aliexpress'))
+    ]);
+
+    let all = [];
+    results.forEach(r => { if (r.status === 'fulfilled') all.push(...r.value); });
+    all.sort((a, b) => a.price - b.price);
+    const cheapest = all[0] || null;
+
+    response = {
+      success: true,
+      mode: 'search',
+      searchTerm: query,
+      sources: all,
+      cheapest: cheapest,
+      apiCallsUsed: 3,
+      scrapedAt: new Date().toISOString()
+    };
+
+    if (saveToFirestore && listingId && cheapest) {
+      await db.collection('orderTracker_listings').doc(listingId).update({
+        sourcePrice: cheapest.price,
+        sourcePlatform: cheapest.platform,
+        sourceLink: cheapest.link,
+        sourceTitle: cheapest.title,
+        sourceCheckedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      response.saved = true;
+    }
+
+    res.json(response);
+
+  } catch (err) {
+    console.error('checkSourcePrices error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Helper: Extract price from a single product page
+function extractSinglePrice(html, url) {
+  let price = null;
+  let title = null;
+  let inStock = true;
+
+  // Price patterns
+  const pricePatterns = [
+    /class="a-price-whole"[^>]*>([\d,]+)/,
+    /class="a-offscreen"[^>]*>£?([\d,\.]+)/,
+    /"priceAmount":\s*([\d\.]+)/,
+    /"price":"£?([\d,\.]+)"/,
+    /data-price="([\d,\.]+)"/,
+    /£([\d,\.]+)/
+  ];
+
+  for (const pattern of pricePatterns) {
+    const match = html.match(pattern);
+    if (match && match[1]) {
+      price = parseFloat(match[1].replace(/,/g, ''));
+      if (!isNaN(price) && price > 0) break;
+    }
+  }
+
+  // Title
+  const titleMatch = html.match(/<title>([^<]+)/) ||
+                     html.match(/id="productTitle"[^>]*>([^<]+)/) ||
+                     html.match(/"name":"([^"]+)"/);
+  if (titleMatch) title = titleMatch[1].trim();
+
+  // Stock check
+  if (html.includes('Out of stock') || html.includes('Currently unavailable') || html.includes('Temporarily out of stock')) {
+    inStock = false;
+  }
+
+  return { price, title, inStock };
+}
+
+
+
+
+
+
