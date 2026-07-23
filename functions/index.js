@@ -240,13 +240,56 @@ async function importOrSyncOrder(account, o) {
   return 'imported';
 }
 
+// ONE-WAY dispatch sync: when OnBuy says an order is dispatched, the
+// dashboard follows (active -> Dispatched). NEVER backwards, never touches
+// any other VA-owned field. Primary signal: OnBuy's real `dispatched` bool.
+// Trap avoided: "Awaiting Dispatch" CONTAINS "dispatch" — exclude 'awaiting'.
+async function syncStatusFromOnBuy(account, o) {
+  const onbuyOrderId = String(o.order_id || '');
+  if (!onbuyOrderId) return 'skipped';
+  const onbuyStatus = o.status || '';
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  let ref = db.collection('orderTracker_orders').doc(orderDocId(onbuyOrderId));
+  let snap = await ref.get();
+  if (!snap.exists) {
+    const legacy = await db.collection('orderTracker_orders')
+      .where('onbuyOrderId', '==', onbuyOrderId).limit(1).get();
+    if (legacy.empty) return 'not-found';
+    ref = legacy.docs[0].ref;
+    snap = await ref.get();
+  }
+
+  const ex = snap.data();
+  const s = onbuyStatus.toLowerCase();
+  const onbuySaysDispatched = o.dispatched === true
+    || ((s.includes('dispatch') || s.includes('shipped') || s.includes('complete')) && !s.includes('awaiting'));
+
+  const updates = { lastSyncedAt: now };
+  if ((ex.onbuyStatus || '') !== onbuyStatus) updates.onbuyStatus = onbuyStatus;
+
+  const currentStatus = String(ex.status || '');
+  const alreadyHandled = currentStatus.toLowerCase() === 'dispatched' || currentStatus === 'Cancelled';
+  if (onbuySaysDispatched && !alreadyHandled) {
+    updates.status = 'Dispatched';
+    updates.statusSource = 'onbuy_sync'; // so we know WHO dispatched (OnBuy direct, not dashboard)
+    if (!ex.dispatchedAt) updates.dispatchedAt = now;
+  }
+
+  if (Object.keys(updates).length > 1) {
+    await ref.update(updates);
+    return updates.status === 'Dispatched' ? 'dispatched' : 'synced';
+  }
+  return 'unchanged';
+}
+
 async function pullOrdersForAccount(account, fullRescan) {
   const token = await getOnBuyToken(account.consumerKey.value(), account.secretKey.value());
 
   // previously_exported=0 stops OnBuy re-sending orders we already pulled.
   // fullRescan mode drops that filter to rescue anything missed by a crash.
   const exportedFilter = fullRescan ? '' : '&filter[previously_exported]=0';
-  const counts = { imported: 0, synced: 0, unchanged: 0, skipped: 0 };
+  const counts = { imported: 0, synced: 0, unchanged: 0, skipped: 0, dispatchedSynced: 0 };
 
   // Paginate: awaiting_dispatch is usually small, but never assume one page.
   for (let page = 1; page <= 10; page++) {
@@ -263,6 +306,22 @@ async function pullOrdersForAccount(account, fullRescan) {
       else counts.skipped++;
     }
     if (orders.length < 100) break; // last page
+  }
+
+  // Dispatch sync pass: recent orders of ANY status. Dispatched orders vanish
+  // from the awaiting filter — this is how the dashboard learns about them.
+  // OnBuy quirk #2 (proven 23 Jul 2026): "updated" is an INVALID sort field
+  // (HTTP 400) — "created" is the valid one. Wrapped so a failure here can
+  // never swallow the import results above.
+  try {
+    const recent = await onbuyGet(token, `/orders?site_id=2000&sort[created]=desc&page=1&limit=100`);
+    for (const o of extractList(recent, `recent orders (${account.name})`)) {
+      const r = await syncStatusFromOnBuy(account, o);
+      if (r === 'dispatched') counts.dispatchedSynced++;
+    }
+  } catch (e) {
+    logger.error(`recent-orders sync failed (${account.name}): ${e.message}`);
+    counts.dispatchSyncError = e.message;
   }
   return counts;
 }
@@ -330,9 +389,14 @@ async function pullListingsForAccount(account) {
   let scanned = 0, written = 0, unchangedCount = 0;
   const touchedIds = [];
 
-  for (let page = 1; page <= 300; page++) { // 300 pages × 100 = 30,000 ceiling
-    const json = await onbuyGet(token, `/listings?site_id=2000&country_code=GB&page=${page}&limit=100`);
-    const listings = extractList(json, `listings page ${page} (${account.name})`);
+  // OnBuy quirk #3 (proven 24 Jul 2026 via listingsProbe): pagination is
+  // offset/limit (metadata returns limit+offset+total_rows), NOT page=N.
+  // Real fields: name (not product_title), stock, opc, condition, sale_price.
+  // winning_status / lead_listing_price DO NOT EXIST here — Buy Box data
+  // lives in OnBuy's CSV export or another endpoint (next-session probe).
+  for (let offset = 0; offset < 30000; offset += 100) {
+    const json = await onbuyGet(token, `/listings?site_id=2000&country_code=GB&limit=100&offset=${offset}`);
+    const listings = extractList(json, `listings offset ${offset} (${account.name})`);
     if (!listings.length) break;
     scanned += listings.length;
 
@@ -364,7 +428,7 @@ async function pullListingsForAccount(account) {
         team: account.team,
         sku: l.sku || '',
         opc: l.opc || '',
-        title: l.product_title || l.title || '',
+        title: l.name || l.product_title || l.title || '', // real OnBuy field: name
         price,
         quantity: stock,
         status,
@@ -816,6 +880,36 @@ exports.testOnBuyAuth = onRequest(
         } catch (e) {
           report.ordersMatrix[p.name] = { error: e.message };
         }
+      }
+    }
+
+    // Listings probe: raw Buy Box field truth (same evidence pattern that
+    // settled every orders question — no guessing, dump what OnBuy sends)
+    if (token) {
+      try {
+        const r = await fetch(`${ONBUY_BASE}/listings?site_id=2000&country_code=GB&page=1&limit=2`, {
+          headers: { Authorization: token },
+        });
+        const j = await r.json().catch(() => ({}));
+        const list = j.results || j.data || j.listings || [];
+        report.listingsProbe = {
+          httpStatus: r.status,
+          topLevelKeys: Object.keys(j).slice(0, 10),
+          metadata: j.metadata || null,
+          listFieldFound: j.results ? 'results' : j.data ? 'data' : j.listings ? 'listings' : 'NONE',
+          firstListingAllKeys: list[0] ? Object.keys(list[0]) : [],
+          winningFieldsRaw: list.slice(0, 2).map(l => ({
+            sku: l.sku,
+            price: l.price,
+            stock: l.stock,
+            winning_status: l.winning_status,
+            winning_status_type: typeof l.winning_status,
+            lead_listing_price: l.lead_listing_price,
+            winning_price: l.winning_price,
+          })),
+        };
+      } catch (e) {
+        report.listingsProbe = { error: e.message };
       }
     }
 
