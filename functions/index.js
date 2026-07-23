@@ -1,45 +1,52 @@
-const axios = require('axios');
-const cheerio = require('cheerio');
 /**
- * TokAxis OnBuy integration — Cloud Functions
- * ============================================
- * Two jobs:
- *  1. pullOnBuyOrders   — runs every 15 min, pulls new orders from both OnBuy
- *                         accounts (Panacea, Samayy), writes them into the
- *                         same Firestore collection the dashboard reads from.
- *  2. pushTrackingToOnBuy — fires instantly whenever a VA/admin adds tracking
- *                         info to an order, sends it back to OnBuy via the
- *                         correct account's API keys.
+ * ============================================================================
+ * ONLISTO — MASTER index.js (single source of truth)
+ * ============================================================================
+ * Rebuilt 23 Jul 2026 from: GitHub backup (40KB) + live Firebase function list
+ * (21 functions) + dashboard HTML contract (onlisto.io).
  *
- * IMPORTANT — before deploying, read the "CONFIRM WITH ONBUY" notes below.
- * OnBuy's docs are an interactive Postman collection; a couple of exact
- * field names (the dispatch payload, courier name list) should be checked
- * against your own account's Postman collection / API page before going
- * live with real orders. Everything else here is taken directly from
- * https://docs.api.onbuy.com/.
+ * FIXES IN THIS FILE (mapped to the bug list):
+ *  #1 node-fetch removed — Node 24 has fetch built in (was MODULE_NOT_FOUND)
+ *  #2 pullOnBuyOrders no longer calls undefined fetchOnBuyOrders; reads API
+ *     keys from Firebase Secrets, not from a non-existent org doc field
+ *  #3 ONE dedupe scheme everywhere: doc ID = onbuy_<orderId> for scheduler
+ *     AND manual pull (was random .add() vs doc() fighting each other)
+ *  #4 OnBuy auth tries BOTH endpoint styles and logs which one works;
+ *     response parsing accepts results|data|orders|listings and logs shape
+ *  #5 API sync NEVER overwrites the dashboard status field. OnBuy truth goes
+ *     to onbuyStatus only. VA-owned status ('Dispatched') is untouchable.
+ *  #6 pullOnBuyListings now PAGINATES (was first ~100 listings only) and
+ *     skips writes when nothing changed (saves Firestore money)
+ *  #7 checkSourcePrices / manualSourceCheck / updateListingSource now need
+ *     ?key=ADMIN_KEY (was open to the whole internet burning Bee credits)
+ *  #8 migrateData removed (open collection copier). Legacy one-time jobs
+ *     intentionally NOT in this file — they get deleted on deploy.
+ *
+ * STILL TO VERIFY WITH ONE REAL CALL (testOnBuyAuth does this):
+ *  - Which OnBuy auth style the live API actually accepts
+ *  - Exact orders/listings response field names on the live account
+ *  - Dispatch + reprice PUT payloads (marked CONFIRM WITH ONBUY below)
+ * ============================================================================
  */
 
 const { onSchedule } = require('firebase-functions/v2/scheduler');
+const { onRequest } = require('firebase-functions/v2/https');
 const { onDocumentUpdated } = require('firebase-functions/v2/firestore');
 const { defineSecret } = require('firebase-functions/params');
 const logger = require('firebase-functions/logger');
-const functions = require('firebase-functions');
 const admin = require('firebase-admin');
-const fetch = require('node-fetch');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 admin.initializeApp();
 const db = admin.firestore();
 
 // ---------------------------------------------------------------------------
-// CONFIG — the one org this runs for right now (Panceaa). If you ever add a
-// second client org to the dashboard, this becomes a loop over orgs instead.
+// CONFIG
 // ---------------------------------------------------------------------------
-const ORG_ID = 'LfCP6mxaSP0WHclScUQC'; // Panceaa — note the zero, not the letter O
+const ORG_ID = 'LfCP6mxaSP0WHclScUQC';
+const ONBUY_BASE = 'https://api.onbuy.com/v2';
 
-// Each OnBuy account gets its own secret pair, stored in Secret Manager
-// (never hardcoded, never committed to git). "team" is the VA name this
-// account maps to in the dashboard — change if your VA/account pairing
-// isn't a simple 1-to-1 match.
 const ACCOUNTS = [
   {
     name: 'Panacea',
@@ -55,146 +62,260 @@ const ACCOUNTS = [
   },
 ];
 
-const ONBUY_BASE = 'https://api.onbuy.com/v2';
+const ALL_SECRETS = ACCOUNTS.flatMap(a => [a.consumerKey, a.secretKey]);
 
 // ---------------------------------------------------------------------------
-// AUTH — get a fresh 15-minute access token for one account.
+// SHARED HELPERS
 // ---------------------------------------------------------------------------
+
+// Bug #4 fix: try the documented auth style first, fall back to the legacy
+// one, and LOG which succeeded so the truth is in the logs, not in guesses.
 async function getOnBuyToken(consumerKey, secretKey) {
-  const res = await fetch(`${ONBUY_BASE}/auth/request_token`, {
+  // Style A: POST /auth/request-token with JSON body (OnBuy docs style)
+  try {
+    const res = await fetch(`${ONBUY_BASE}/auth/request-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ consumer_key: consumerKey, secret_key: secretKey }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (res.ok && json.access_token) {
+      logger.info('OnBuy auth OK: request-token (json)');
+      return json.access_token;
+    }
+    logger.warn(`OnBuy auth style A failed: ${res.status} ${JSON.stringify(json).slice(0, 200)}`);
+  } catch (e) {
+    logger.warn(`OnBuy auth style A error: ${e.message}`);
+  }
+
+  // Style B: POST /auth/request_token with form-encoded body (legacy style)
+  const res2 = await fetch(`${ONBUY_BASE}/auth/request_token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ consumer_key: consumerKey, secret_key: secretKey }),
   });
-  const json = await res.json();
-  if (!res.ok || !json.access_token) {
-    throw new Error(`OnBuy auth failed: ${res.status} ${JSON.stringify(json)}`);
+  const json2 = await res2.json().catch(() => ({}));
+  if (!res2.ok || !json2.access_token) {
+    throw new Error(`OnBuy auth failed BOTH styles. Style B: ${res2.status} ${JSON.stringify(json2).slice(0, 200)}`);
   }
-  return json.access_token;
+  logger.info('OnBuy auth OK: request_token (form)');
+  return json2.access_token;
+}
+
+// OnBuy quirk (PROVEN 23 Jul 2026 via testOnBuyAuth 4-way matrix):
+// API calls need the RAW token — a "Bearer " prefix gets HTTP 401.
+// Path is /orders?site_id=2000 — /sites/2000/orders gets HTTP 404.
+// Order lists come back in json.results (NOT json.data / json.orders).
+async function onbuyGet(token, path) {
+  const res = await fetch(`${ONBUY_BASE}${path}`, {
+    headers: { Authorization: token },
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`OnBuy GET ${path} failed: ${res.status} ${JSON.stringify(json).slice(0, 300)}`);
+  }
+  return json;
+}
+
+// Bug #4 fix: accept every known list-shape and log when none matches.
+function extractList(json, context) {
+  const arr = json.results || json.data || json.orders || json.listings;
+  if (Array.isArray(arr)) return arr;
+  logger.warn(`${context}: UNKNOWN response shape. Top-level keys: ${Object.keys(json).join(', ')}`);
+  return [];
+}
+
+// Bug #7 fix: shared admin-key guard for every public HTTP endpoint.
+function checkAdminKey(req, res) {
+  const expected = process.env.ADMIN_KEY || '';
+  if (!expected) {
+    res.status(503).json({ error: 'ADMIN_KEY is not set in functions/.env — add it and redeploy.' });
+    return false;
+  }
+  const got = req.query.key || req.get('x-admin-key') || (req.body && req.body.key) || '';
+  if (got !== expected) {
+    res.status(401).json({ error: 'Invalid or missing key. Add ?key=YOUR_ADMIN_KEY' });
+    return false;
+  }
+  return true;
+}
+
+function getScrapingBeeKey() {
+  return process.env.SCRAPINGBEE_API_KEY || '';
+}
+
+// Bug #3 fix: ONE deterministic doc ID for every order, everywhere.
+function orderDocId(onbuyOrderId) {
+  return `onbuy_${String(onbuyOrderId).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
 
 // ---------------------------------------------------------------------------
-// JOB 1 — pull new orders in, every 15 minutes.
+// ORDERS — one shared import/sync path (scheduler + manual use the same code)
 // ---------------------------------------------------------------------------
+async function importOrSyncOrder(account, o) {
+  const onbuyOrderId = String(o.order_id || o.id || o.order_number || '');
+  if (!onbuyOrderId) {
+    logger.warn(`${account.name}: skipping order with no order_id.`);
+    return 'skipped';
+  }
+
+  const item = (o.products && o.products[0]) || {};
+  const addr = o.delivery_address || {};
+  const onbuyStatus = o.status || '';
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const ref = db.collection('orderTracker_orders').doc(orderDocId(onbuyOrderId));
+  const snap = await ref.get();
+
+  if (snap.exists) {
+    // Bug #5 fix: mirror OnBuy truth into onbuyStatus ONLY.
+    // Never touch `status` — that field belongs to the VA/dashboard workflow.
+    const ex = snap.data();
+    const updates = { lastSyncedAt: now };
+    if ((ex.onbuyStatus || '') !== onbuyStatus) updates.onbuyStatus = onbuyStatus;
+    if (!ex.account) { updates.account = account.name; updates.team = account.team; }
+    if (!ex.orgId) updates.orgId = ORG_ID;
+    // Flag cancellations/refunds for a human instead of silently changing data
+    const s = onbuyStatus.toLowerCase();
+    if ((s.includes('cancel') || s.includes('refund')) && ex.status !== 'Cancelled') {
+      updates.needsAttention = true;
+      updates.attentionReason = `OnBuy shows: ${onbuyStatus}`;
+    }
+    if (Object.keys(updates).length > 1) {
+      await ref.update(updates);
+      return 'synced';
+    }
+    return 'unchanged';
+  }
+
+  // Legacy guard: older imports used random doc IDs. One cheap query catches
+  // them so we never duplicate an order that arrived before this scheme.
+  const legacy = await db.collection('orderTracker_orders')
+    .where('onbuyOrderId', '==', onbuyOrderId).limit(1).get();
+  if (!legacy.empty) {
+    await legacy.docs[0].ref.update({ onbuyStatus, lastSyncedAt: now });
+    return 'synced-legacy';
+  }
+
+  await ref.set({
+    orgId: ORG_ID,
+    team: account.team,
+    account: account.name,
+    platform: '',
+    orderNo: onbuyOrderId,
+    onbuyOrderId,
+    sku: item.sku || o.sku || '',
+    opc: item.opc || o.opc || '',
+    item: item.title || item.name || o.product_title || 'Imported from OnBuy',
+    qty: Number(item.quantity || o.quantity || 1),
+    sellingPrice: Number(o.price_total ?? o.total ?? item.price ?? 0),      // real OnBuy field: price_total
+    onbuyFee: Number(o.sales_fee_inc_VAT ?? o.sales_fee_ex_VAT ?? o.sales_fee ?? 0), // real OnBuy field
+    amount: 0,                    // sourcing cost — VA fills this in
+    sourceOrderNo: '',
+    sourceLink: '',
+    notes: '',
+    buyerName: addr.name || (o.buyer && o.buyer.name) || '',
+    buyerPhone: addr.phone || '',
+    buyerEmail: (o.buyer && o.buyer.email) || '',
+    buyerAddress: [addr.line_1, addr.town].filter(Boolean).join(', '),
+    buyerPostcode: addr.postcode || '',
+    onbuyOrderDate: (o.date || o.created || '').slice(0, 10), // real OnBuy field: date
+    status: 'active',             // VA workflow starts here — dashboard-owned
+    onbuyStatus,
+    trackingNumber: '',
+    trackingCarrier: '',
+    dispatchedToOnbuy: false,
+    dispatchedAt: null,
+    unlockedTeam: null,
+    unlockRequested: false,
+    unlockRequestReason: null,
+    refundAmount: null,
+    refundReason: null,
+    refundAt: null,
+    lastEditedAt: null,
+    importedFromApi: true,
+    needsSourcingInfo: true,
+    createdAt: now,
+    lastSyncedAt: now,
+  });
+  return 'imported';
+}
+
+async function pullOrdersForAccount(account, fullRescan) {
+  const token = await getOnBuyToken(account.consumerKey.value(), account.secretKey.value());
+
+  // previously_exported=0 stops OnBuy re-sending orders we already pulled.
+  // fullRescan mode drops that filter to rescue anything missed by a crash.
+  const exportedFilter = fullRescan ? '' : '&filter[previously_exported]=0';
+  const counts = { imported: 0, synced: 0, unchanged: 0, skipped: 0 };
+
+  // Paginate: awaiting_dispatch is usually small, but never assume one page.
+  for (let page = 1; page <= 10; page++) {
+    const json = await onbuyGet(token,
+      `/orders?site_id=2000&filter[status]=awaiting_dispatch${exportedFilter}&sort[created]=asc&page=${page}&limit=100`);
+    const orders = extractList(json, `orders page ${page} (${account.name})`);
+    if (!orders.length) break;
+
+    for (const o of orders) {
+      const result = await importOrSyncOrder(account, o);
+      if (result === 'imported') counts.imported++;
+      else if (result.startsWith('synced')) counts.synced++;
+      else if (result === 'unchanged') counts.unchanged++;
+      else counts.skipped++;
+    }
+    if (orders.length < 100) break; // last page
+  }
+  return counts;
+}
+
+// SCHEDULED — every 15 minutes, both accounts
 exports.scheduledPullOnBuyOrders = onSchedule(
-  {
-    schedule: 'every 15 minutes',
-    secrets: ACCOUNTS.flatMap(a => [a.consumerKey, a.secretKey]),
-    timeoutSeconds: 120,
-  },
+  { schedule: 'every 15 minutes', secrets: ALL_SECRETS, timeoutSeconds: 300, memory: '512MiB' },
   async () => {
     for (const account of ACCOUNTS) {
       try {
-        await pullOrdersForAccount(account);
+        const c = await pullOrdersForAccount(account, false);
+        logger.info(`${account.name}: ${c.imported} imported, ${c.synced} synced, ${c.unchanged} unchanged, ${c.skipped} skipped`);
       } catch (e) {
-        // One account failing shouldn't stop the other from being checked.
-        logger.error(`Failed pulling orders for ${account.name}: ${e.message}`);
+        logger.error(`scheduledPullOnBuyOrders ${account.name}: ${e.message}`);
       }
     }
   }
 );
 
-async function pullOrdersForAccount(account) {
-  const consumerKey = account.consumerKey.value();
-  const secretKey = account.secretKey.value();
-  const token = await getOnBuyToken(consumerKey, secretKey);
+// MANUAL — same code path, run from browser. ?key=...&account=panacea&full=1
+exports.pullOnBuyOrders = onRequest(
+  { secrets: ALL_SECRETS, timeoutSeconds: 540, memory: '1GiB' },
+  async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const fullRescan = req.query.full === '1';
+    const wanted = (req.query.account || 'all').toLowerCase();
+    const results = {};
 
-  // filter[status]=awaiting_dispatch — only pull orders that still need
-  // sourcing/dispatching, not ones already completed long ago.
-  // filter[previously_exported]=0 — OnBuy tracks per-integration whether an
-  // order has already been fetched, so this alone should stop duplicates
-  // arriving from OnBuy's side — we ALSO double-check against our own
-  // database below, belt-and-braces.
-const url = `${ONBUY_BASE}/orders?site_id=2000&filter[status]=awaiting_dispatch&filter[previously_exported]=0&sort[created]=asc`;  const res = await fetch(url, { headers: { Authorization: token } });
-  const json = await res.json();
-  if (!res.ok) throw new Error(`OnBuy orders fetch failed: ${res.status} ${JSON.stringify(json)}`);
-
-  const orders = json.data || json.orders || [];
-  if (!orders.length) {
-    logger.info(`${account.name}: no new orders.`);
-    return;
+    for (const account of ACCOUNTS) {
+      if (wanted !== 'all' && account.team !== wanted && account.name.toLowerCase() !== wanted) continue;
+      try {
+        results[account.name] = await pullOrdersForAccount(account, fullRescan);
+      } catch (e) {
+        results[account.name] = { error: e.message };
+        logger.error(`pullOnBuyOrders ${account.name}: ${e.message}`);
+      }
+    }
+    res.json({ success: true, fullRescan, results });
   }
-
-  for (const o of orders) {
-    await importOneOrder(account, o);
-  }
-}
-
-async function importOneOrder(account, o) {
-  // CONFIRM WITH ONBUY: field names below (order_id, sku, price, etc.) are
-  // based on OnBuy's published examples. Double-check the exact shape of
-  // one real order response in Postman before relying on this in production
-  // — marketplace order payloads sometimes nest items under a "products"
-  // array rather than flat fields.
-  const onbuyOrderId = o.order_id || o.id;
-  if (!onbuyOrderId) {
-    logger.warn(`${account.name}: skipping an order with no order_id.`);
-    return;
-  }
-
-  // Dedupe check — never import the same OnBuy order number twice, same
-  // safeguard as the manual entry form already has.
-  const existing = await db.collection('orderTracker_orders')
-    .where('orgId', '==', ORG_ID)
-    .where('onbuyOrderId', '==', onbuyOrderId)
-    .limit(1)
-    .get();
-  if (!existing.empty) {
-    logger.info(`${account.name}: order ${onbuyOrderId} already imported, skipping.`);
-    return;
-  }
-
-  const item = (o.products && o.products[0]) || {};
-
-  await db.collection('orderTracker_orders').add({
-    orgId: ORG_ID,
-    team: account.team,
-    account: account.name,
-    platform: '',            // VA still needs to fill this in — where they sourced it
-    orderNo: onbuyOrderId,
-    onbuyOrderId,
-    sku: item.sku || '',
-    sourceOrderNo: '',       // VA fills this in once they've bought it
-    sourceLink: '',          // VA fills this in once they've bought it
-    item: item.title || item.name || 'Imported from OnBuy',
-    amount: 0,               // sourcing cost — VA fills this in
-    notes: '',
-    qty: item.quantity || 1,
-    sellingPrice: parseFloat(o.total || item.price || 0),
-    onbuyFee: parseFloat(o.sales_fee || o.fee || 0),
-    buyerName: (o.delivery_address && o.delivery_address.name) || '',
-    buyerPhone: (o.delivery_address && o.delivery_address.phone) || '',
-    buyerAddress: (o.delivery_address && [o.delivery_address.line_1, o.delivery_address.town].filter(Boolean).join(', ')) || '',
-    buyerPostcode: (o.delivery_address && o.delivery_address.postcode) || '',
-    onbuyOrderDate: (o.created || '').slice(0, 10),
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    status: 'active',
-    unlockedTeam: null, unlockRequested: false, unlockRequestReason: null,
-    refundAmount: null, refundReason: null, refundAt: null, lastEditedAt: null,
-    importedFromApi: true,
-    needsSourcingInfo: true,   // dashboard can flag these until a VA completes them
-    trackingNumber: '', trackingCarrier: '', dispatchedToOnbuy: false, dispatchedAt: null,
-  });
-
-  logger.info(`${account.name}: imported order ${onbuyOrderId}.`);
-}
+);
 
 // ---------------------------------------------------------------------------
-// JOB 3 — monitor live listings (price, stock, active/inactive), every 15 min.
-// Writes into a separate collection so it doesn't interfere with orders.
+// LISTINGS — Bug #6 fix: full pagination + change detection (saves money)
+// Runs hourly. Replaces both old pullOnBuyListings and pullOnBuyListingsHourly.
 // ---------------------------------------------------------------------------
 exports.pullOnBuyListings = onSchedule(
-  {
-    schedule: 'every 15 minutes',
-    secrets: ACCOUNTS.flatMap(a => [a.consumerKey, a.secretKey]),
-    timeoutSeconds: 120,
-  },
+  { schedule: 'every 60 minutes', secrets: ALL_SECRETS, timeoutSeconds: 540, memory: '1GiB' },
   async () => {
     for (const account of ACCOUNTS) {
       try {
         await pullListingsForAccount(account);
       } catch (e) {
-        logger.error(`Failed pulling listings for ${account.name}: ${e.message}`);
+        logger.error(`pullOnBuyListings ${account.name}: ${e.message}`);
       }
     }
   }
@@ -202,80 +323,84 @@ exports.pullOnBuyListings = onSchedule(
 
 async function pullListingsForAccount(account) {
   const token = await getOnBuyToken(account.consumerKey.value(), account.secretKey.value());
-
-  // Field names below are confirmed against a real OnBuy listings CSV export
-  // (16,252 real rows checked on 6 Jul 2026) — sku, price, stock, opc,
-  // product_title, suspended_reason, winning_status, lead_listing_price all
-  // matched real data. The live JSON API response *should* use the same
-  // names since CSV exports and API responses are normally generated from
-  // the same underlying fields, but if the first live run comes back empty
-  // or odd, check the Logs tab — that's the one thing still worth a 2-minute
-  // sanity check on a real API call before trusting this fully.
-  const url = `${ONBUY_BASE}/listings?site_id=2000&country_code=GB`;
-  const res = await fetch(url, { headers: { Authorization: token } });
-  const json = await res.json();
-  if (!res.ok) throw new Error(`OnBuy listings fetch failed: ${res.status} ${JSON.stringify(json)}`);
-
-  const listings = json.data || json.listings || [];
-  const batch = db.batch();
   const now = admin.firestore.FieldValue.serverTimestamp();
 
-  for (const l of listings) {
-    // Confirmed against a real OnBuy listings export on 6 Jul 2026 — these
-    // are the real field names, not guesses.
-    const docId = `${account.name}_${l.sku || l.opc}`;
-    const ref = db.collection('orderTracker_listings').doc(docId);
-    const stock = parseInt(l.stock ?? 0, 10);
-    const suspended = !!(l.suspended_reason && l.suspended_reason.trim());
-    const price = parseFloat(l.price || 0);
-    const competingPrice = parseFloat(l.lead_listing_price || l.winning_price || 0);
-    const winningBuyBox = l.winning_status === '1';
+  let batch = db.batch();
+  let batchOps = 0;
+  let scanned = 0, written = 0, unchangedCount = 0;
+  const touchedIds = [];
 
-    // Suggest-only for now — does NOT touch the live OnBuy price. See the
-    // pending floor-price decision before this becomes an actual auto-push.
-    const canWinByRepricing = !winningBuyBox && stock > 0 && competingPrice > 0 && competingPrice < price;
-    const suggestedPrice = canWinByRepricing ? Math.max(0.01, competingPrice - 0.01) : null;
+  for (let page = 1; page <= 300; page++) { // 300 pages × 100 = 30,000 ceiling
+    const json = await onbuyGet(token, `/listings?site_id=2000&country_code=GB&page=${page}&limit=100`);
+    const listings = extractList(json, `listings page ${page} (${account.name})`);
+    if (!listings.length) break;
+    scanned += listings.length;
 
-    batch.set(ref, {
-      orgId: ORG_ID,
-      account: account.name,
-      team: account.team,
-      sku: l.sku || '',
-      opc: l.opc || '',
-      title: l.product_title || '',
-      price,
-      quantity: stock,
-      status: suspended ? 'suspended' : (stock > 0 ? 'active' : 'out_of_stock'),
-      suspendedReason: l.suspended_reason || '',
-      winningBuyBox,
-      competingPrice,
-      suggestedRepriceTo: suggestedPrice,   // null until floor-price rule is agreed & built
-      category: l.category || '',
-      brandName: l['brand name'] || l.brand_name || '',
-      gtin: l.gtin || '',
-      lastCheckedAt: now,
-    }, { merge: true });
+    // Change detection: read existing docs in chunks so unchanged listings
+    // cost 1 read instead of 1 write (reads are 3x cheaper, and most
+    // listings don't change hour to hour).
+    const refs = listings.map(l => db.collection('orderTracker_listings').doc(`${account.name}_${l.sku || l.opc}`));
+    const existing = await db.getAll(...refs);
+
+    for (let i = 0; i < listings.length; i++) {
+      const l = listings[i];
+      const stock = parseInt(l.stock ?? 0, 10);
+      const suspended = !!(l.suspended_reason && String(l.suspended_reason).trim());
+      const price = parseFloat(l.price || 0);
+      const competingPrice = parseFloat(l.lead_listing_price || l.winning_price || 0);
+      const winningBuyBox = String(l.winning_status) === '1';
+      const status = suspended ? 'suspended' : (stock > 0 ? 'active' : 'out_of_stock');
+      const canWinByRepricing = !winningBuyBox && stock > 0 && competingPrice > 0 && competingPrice < price;
+      const suggestedPrice = canWinByRepricing ? Math.max(0.01, competingPrice - 0.01) : null;
+
+      // Fingerprint: if nothing meaningful changed, skip the write entirely.
+      const fp = `${price}|${stock}|${status}|${winningBuyBox}|${competingPrice}`;
+      const docSnap = existing[i];
+      if (docSnap.exists && docSnap.data()._fp === fp) { unchangedCount++; continue; }
+
+      batch.set(refs[i], {
+        orgId: ORG_ID,
+        account: account.name,
+        team: account.team,
+        sku: l.sku || '',
+        opc: l.opc || '',
+        title: l.product_title || l.title || '',
+        price,
+        quantity: stock,
+        status,
+        suspendedReason: l.suspended_reason || '',
+        winningBuyBox,
+        competingPrice,
+        suggestedRepriceTo: suggestedPrice,
+        category: l.category || '',
+        brandName: l['brand name'] || l.brand_name || '',
+        gtin: l.gtin || '',
+        lastCheckedAt: now,
+        _fp: fp,
+      }, { merge: true });
+      batchOps++;
+      written++;
+      touchedIds.push(refs[i].id);
+
+      if (batchOps >= 400) {
+        await batch.commit();
+        batch = db.batch();
+        batchOps = 0;
+      }
+    }
+    if (listings.length < 100) break; // last page
   }
-  await batch.commit();
-  logger.info(`${account.name}: checked ${listings.length} listings.`);
+  if (batchOps > 0) await batch.commit();
+
+  logger.info(`${account.name}: scanned ${scanned}, wrote ${written}, unchanged ${unchangedCount}`);
 }
 
-
 // ---------------------------------------------------------------------------
-// JOB 4 — auto-reprice to win the buy box, but never below a safe floor.
-//
-// Floor = (most recent sourcing cost logged for that SKU × (1 + your margin%))
-//         ÷ (1 − OnBuy's actual observed fee rate on that SKU's last sale)
-//
-// Using your OWN last logged order's real fee (rather than guessing OnBuy's
-// tiered fee table) means the floor reflects what OnBuy actually took last
-// time, not a theoretical rate.
-//
-// If a SKU has never been logged with a cost, or the competing price is
-// below what your floor allows, nothing gets pushed — it's left flagged in
-// Firestore for you to look at, never silently undercut.
+// REPRICER — user decision 23 Jul 2026: KEEP LIVE (pushes real OnBuy prices).
+// Floor = (last logged cost × (1 + margin%)) ÷ (1 − real fee rate).
+// Never goes below floor; never touches SKUs with no logged cost.
 // ---------------------------------------------------------------------------
-const DEFAULT_MARGIN_PERCENT = 15; // used only if the org doc has no override
+const DEFAULT_MARGIN_PERCENT = 15;
 
 async function getMarginPercent() {
   const orgDoc = await db.collection('orderTracker_orgs').doc(ORG_ID).get();
@@ -288,69 +413,69 @@ async function getMostRecentCostAndFeeRate(sku) {
     .where('orgId', '==', ORG_ID)
     .where('sku', '==', sku)
     .where('amount', '>', 0)
-    .orderBy('amount') // Firestore requires the inequality field ordered first
+    .orderBy('amount')
     .orderBy('createdAt', 'desc')
     .limit(1)
     .get();
   if (snap.empty) return null;
   const o = snap.docs[0].data();
   if (!o.sellingPrice || o.sellingPrice <= 0) return null;
-  const feeRate = (o.onbuyFee || 0) / o.sellingPrice;
-  return { cost: o.amount, feeRate };
+  return { cost: o.amount, feeRate: (o.onbuyFee || 0) / o.sellingPrice };
 }
 
 function calcFloor(cost, feeRate, marginPercent) {
   const denom = 1 - feeRate;
-  if (denom <= 0) return null; // fee rate of 100%+ makes this unsolvable — flag, don't guess
+  if (denom <= 0) return null;
   return (cost * (1 + marginPercent / 100)) / denom;
 }
 
 exports.repriceToWinBuyBox = onSchedule(
-  {
-    schedule: 'every 15 minutes',
-    secrets: ACCOUNTS.flatMap(a => [a.consumerKey, a.secretKey]),
-    timeoutSeconds: 180,
-  },
+  { schedule: 'every 15 minutes', secrets: ALL_SECRETS, timeoutSeconds: 300, memory: '512MiB' },
   async () => {
     const marginPercent = await getMarginPercent();
-    const candidates = await db.collection('orderTracker_listings')
-      .where('orgId', '==', ORG_ID)
-      .where('suggestedRepriceTo', '>', 0)
-      .get();
 
+    let candidates;
+    try {
+      candidates = await db.collection('orderTracker_listings')
+        .where('orgId', '==', ORG_ID)
+        .where('suggestedRepriceTo', '>', 0)
+        .get();
+    } catch (e) {
+      // If this error mentions an INDEX, click the link in the log once.
+      logger.error(`repriceToWinBuyBox candidates query failed: ${e.message}`);
+      return;
+    }
     if (candidates.empty) {
       logger.info('No reprice candidates this run.');
       return;
     }
 
-    // Group approved price changes by account, so we can batch-push to
-    // OnBuy's PUT /v2/listings/by-sku endpoint (up to 1,000 SKUs per call).
     const toPushByAccount = {};
-
     for (const doc of candidates.docs) {
       const l = doc.data();
-      const costInfo = await getMostRecentCostAndFeeRate(l.sku);
-
+      let costInfo = null;
+      try {
+        costInfo = await getMostRecentCostAndFeeRate(l.sku);
+      } catch (e) {
+        logger.error(`cost lookup failed for ${l.sku}: ${e.message}`);
+        continue;
+      }
       if (!costInfo) {
         await doc.ref.update({ repriceStatus: 'no_cost_data_logged' });
         continue;
       }
-
       const floor = calcFloor(costInfo.cost, costInfo.feeRate, marginPercent);
       if (floor === null) {
         await doc.ref.update({ repriceStatus: 'fee_rate_too_high_to_calculate' });
         continue;
       }
-
       if (l.suggestedRepriceTo < floor) {
-        // Winning the buy box here would mean selling at a loss — skip.
         await doc.ref.update({
           repriceStatus: 'below_floor_skipped',
           calculatedFloor: Math.round(floor * 100) / 100,
         });
         continue;
       }
-
       const newPrice = Math.round(l.suggestedRepriceTo * 100) / 100;
       if (!toPushByAccount[l.account]) toPushByAccount[l.account] = [];
       toPushByAccount[l.account].push({ sku: l.sku, price: newPrice, docRef: doc.ref, floor });
@@ -359,28 +484,28 @@ exports.repriceToWinBuyBox = onSchedule(
     for (const accountName of Object.keys(toPushByAccount)) {
       const account = ACCOUNTS.find(a => a.name === accountName);
       if (!account) continue;
-      const items = toPushByAccount[accountName];
-
+      const items = toPushByAccount[accountName].slice(0, 1000); // OnBuy batch cap
       try {
         const token = await getOnBuyToken(account.consumerKey.value(), account.secretKey.value());
-        // CONFIRM WITH ONBUY: exact body shape for PUT /v2/listings/by-sku —
-        // taken from the docs' description, not a tested real response.
+        // CONFIRM WITH ONBUY: exact PUT body shape for /v2/listings/by-sku
         const res = await fetch(`${ONBUY_BASE}/listings/by-sku`, {
           method: 'PUT',
           headers: { Authorization: token, 'Content-Type': 'application/json' },
           body: JSON.stringify(items.map(i => ({ sku: i.sku, price: i.price }))),
         });
-        const json = await res.json();
-        if (!res.ok) throw new Error(`OnBuy reprice push failed: ${res.status} ${JSON.stringify(json)}`);
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(`${res.status} ${JSON.stringify(json).slice(0, 300)}`);
 
+        const batch = db.batch();
         for (const i of items) {
-          await i.docRef.update({
+          batch.update(i.docRef, {
             price: i.price,
             repriceStatus: 'repriced',
             calculatedFloor: Math.round(i.floor * 100) / 100,
             lastRepricedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
         }
+        await batch.commit();
         logger.info(`${accountName}: repriced ${items.length} listing(s).`);
       } catch (e) {
         logger.error(`${accountName}: reprice push failed — ${e.message}`);
@@ -389,223 +514,318 @@ exports.repriceToWinBuyBox = onSchedule(
   }
 );
 
+// ---------------------------------------------------------------------------
+// DISPATCH PUSH — VA adds tracking on dashboard → send it to OnBuy instantly
+// ---------------------------------------------------------------------------
 exports.pushTrackingToOnBuy = onDocumentUpdated(
-  {
-    document: 'orderTracker_orders/{orderId}',
-    secrets: ACCOUNTS.flatMap(a => [a.consumerKey, a.secretKey]),
-  },
+  { document: 'orderTracker_orders/{orderId}', secrets: ALL_SECRETS },
   async (event) => {
     const before = event.data.before.data();
     const after = event.data.after.data();
 
-    // Only fire when tracking has just been added/changed, and only for
-    // orders that came in through the API (so we know their onbuyOrderId
-    // and which account they belong to).
     const trackingJustAdded = after.trackingNumber && after.trackingNumber !== before.trackingNumber;
     if (!trackingJustAdded || !after.onbuyOrderId || !after.account) return;
-    if (after.dispatchedToOnbuy) return; // already sent, don't resend
+    if (after.dispatchedToOnbuy) return;
 
     const account = ACCOUNTS.find(a => a.name === after.account);
     if (!account) {
-      logger.error(`No matching OnBuy account config for "${after.account}".`);
+      logger.error(`No OnBuy account config for "${after.account}".`);
       return;
     }
 
     try {
       const token = await getOnBuyToken(account.consumerKey.value(), account.secretKey.value());
-
-const res = await fetch(`${ONBUY_BASE}/orders/dispatch`, {
-      method: 'PUT',
-      headers: { Authorization: token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        site_id: 2000,
-        orders: [{
-          order_id: after.onbuyOrderId,
-          tracking: {
-            supplier_name: after.trackingCarrier || '',
-            number: after.trackingNumber,
-          },
-        }],
-      }),
-    });
-      const json = await res.json();
-      if (!res.ok) throw new Error(`OnBuy dispatch failed: ${res.status} ${JSON.stringify(json)}`);
+      // CONFIRM WITH ONBUY: exact dispatch payload + courier name list
+      const res = await fetch(`${ONBUY_BASE}/orders/dispatch`, {
+        method: 'PUT',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          site_id: 2000,
+          orders: [{
+            order_id: after.onbuyOrderId,
+            tracking: {
+              supplier_name: after.trackingCarrier || '',
+              number: after.trackingNumber,
+            },
+          }],
+        }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(`${res.status} ${JSON.stringify(json).slice(0, 300)}`);
 
       await event.data.after.ref.update({
         dispatchedToOnbuy: true,
         dispatchedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      logger.info(`Dispatched tracking for order ${after.onbuyOrderId} on ${account.name}.`);
+      logger.info(`Dispatched tracking for order ${after.onbuyOrderId} (${account.name}).`);
     } catch (e) {
-      logger.error(`Failed to push tracking for order ${after.onbuyOrderId}: ${e.message}`);
-      // Leaving dispatchedToOnbuy as false means we'll know from Firestore
-      // this one needs manual attention / a retry.
+      logger.error(`Dispatch push failed for ${after.onbuyOrderId}: ${e.message}`);
     }
   }
 );
-const {onRequest} = require('firebase-functions/v2/https');
 
-exports.migrateData = onRequest({cors: true}, async (req, res) => {
-  const source = req.query.source;
-  const dest = req.query.dest;
-  const limitCount = req.query.limit || 500;
+// ---------------------------------------------------------------------------
+// FIX STALE ORDERS (rewritten — old source was lost)
+// Dry-run by default. Add &execute=true to actually write.
+// Usage: /fixStaleOrders?key=...&days=14            → shows what WOULD change
+//        /fixStaleOrders?key=...&days=14&execute=true → marks them Dispatched
+// ---------------------------------------------------------------------------
+exports.fixStaleOrders = onRequest(
+  { timeoutSeconds: 540, memory: '512MiB' },
+  async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const days = Number(req.query.days || 14);
+    const execute = req.query.execute === 'true';
+    const cutoff = admin.firestore.Timestamp.fromDate(new Date(Date.now() - days * 864e5));
 
-  if (!source || !dest) {
-    return res.status(400).json({error: "Missing source or dest query params"});
-  }
+    const snap = await db.collection('orderTracker_orders')
+      .where('createdAt', '<', cutoff)
+      .get();
 
-  const db = admin.firestore();
-  const sourceRef = db.collection(source);
-  const destRef = db.collection(dest);
-
-  try {
-    const snapshot = await sourceRef.limit(Number(limitCount)).get();
-    if (snapshot.empty) {
-      return res.json({migrated: 0, message: "Source collection is empty"});
-    }
-
-    const batch = db.batch();
-    let count = 0;
-    snapshot.forEach(doc => {
-      batch.set(destRef.doc(doc.id), doc.data());
-      count++;
+    const stale = snap.docs.filter(d => {
+      const o = d.data();
+      const s = String(o.status || '').toLowerCase();
+      const alreadyDone = s === 'dispatched' || s.includes('cancel') || s.includes('refund') || o.dispatchedToOnbuy === true;
+      return !alreadyDone;
     });
 
-    await batch.commit();
+    if (!execute) {
+      return res.json({
+        success: true,
+        dryRun: true,
+        olderThanDays: days,
+        totalOldOrders: snap.size,
+        staleCount: stale.length,
+        sample: stale.slice(0, 20).map(d => ({ id: d.id, status: d.data().status, account: d.data().account })),
+        message: 'DRY RUN — add &execute=true to the URL to actually mark these as Dispatched.',
+      });
+    }
+
+    let batch = db.batch();
+    let ops = 0, fixed = 0;
+    for (const d of stale) {
+      batch.update(d.ref, {
+        status: 'Dispatched',
+        staleFixedAt: admin.firestore.FieldValue.serverTimestamp(),
+        staleFixNote: `Auto-marked Dispatched (older than ${days} days)`,
+      });
+      ops++; fixed++;
+      if (ops >= 400) { await batch.commit(); batch = db.batch(); ops = 0; }
+    }
+    if (ops > 0) await batch.commit();
+
+    res.json({ success: true, dryRun: false, fixed, message: `${fixed} stale orders marked Dispatched.` });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// GET LIVE DATA (read-only) — the closed-loop debugging API.
+// Lets an AI assistant read LIVE Firestore to compare what the CODE says
+// vs what the DATA actually shows. Own READONLY_KEY: can read, never write.
+// Buyer contact details (email/phone/address/postcode) are always stripped.
+//
+//   /getLiveData?key=...                          → system heartbeat (counts)
+//   /getLiveData?key=...&mode=collection&name=orderTracker_orders&limit=20
+// ---------------------------------------------------------------------------
+const READABLE = /^orderTracker_[a-zA-Z]+$/;
+
+function serializeDoc(data) {
+  const out = {};
+  for (const [k, v] of Object.entries(data)) {
+    if (v && typeof v.toDate === 'function') out[k] = v.toDate().toISOString();
+    else if (Array.isArray(v)) out[k] = v.slice(0, 5); // cap history arrays
+    else out[k] = v;
+  }
+  delete out.buyerEmail;
+  delete out.buyerPhone;
+  delete out.buyerAddress;
+  delete out.buyerPostcode;
+  return out;
+}
+
+exports.getLiveData = onRequest({ cors: true, timeoutSeconds: 120 }, async (req, res) => {
+  const expected = process.env.READONLY_KEY || '';
+  if (!expected) {
+    res.status(503).json({ error: 'READONLY_KEY is not set in functions/.env — add it and redeploy.' });
+    return;
+  }
+  if ((req.query.key || '') !== expected) {
+    res.status(401).json({ error: 'Invalid or missing key. Add ?key=YOUR_READONLY_KEY' });
+    return;
+  }
+
+  try {
+    const mode = req.query.mode || 'overview';
+
+    if (mode === 'collection') {
+      const name = String(req.query.name || '');
+      if (!READABLE.test(name)) {
+        res.status(400).json({
+          error: 'name must be an orderTracker_* collection',
+          example: '/getLiveData?key=...&mode=collection&name=orderTracker_orders&limit=20',
+        });
+        return;
+      }
+      const limit = Math.min(Number(req.query.limit || 20), 100);
+      const snap = await db.collection(name).limit(limit).get();
+      const docs = snap.docs.map(d => ({ id: d.id, ...serializeDoc(d.data()) }));
+      res.json({ success: true, collection: name, returned: docs.length, docs });
+      return;
+    }
+
+    // default: overview heartbeat — cheap aggregation counts
+    const countOf = async (name, field, value) => {
+      let q = db.collection(name);
+      if (field !== undefined) q = q.where(field, '==', value);
+      const agg = await q.count().get();
+      return agg.data().count;
+    };
+
+    const recentOrdersSnap = await db.collection('orderTracker_orders')
+      .orderBy('createdAt', 'desc').limit(5).get();
+    const recentOrders = recentOrdersSnap.docs.map(d => {
+      const o = d.data();
+      return {
+        id: d.id, orderNo: o.orderNo, account: o.account, status: o.status,
+        onbuyStatus: o.onbuyStatus || null, sellingPrice: o.sellingPrice,
+        onbuyFee: o.onbuyFee, amount: o.amount, dispatchedToOnbuy: !!o.dispatchedToOnbuy,
+        createdAt: o.createdAt && o.createdAt.toDate ? o.createdAt.toDate().toISOString() : null,
+      };
+    });
 
     res.json({
       success: true,
-      migrated: count,
-      source: source,
-      destination: dest,
-      message: "Migrated " + count + " documents from " + source + " to " + dest
+      generatedAt: new Date().toISOString(),
+      orders: {
+        total: await countOf('orderTracker_orders'),
+        active: await countOf('orderTracker_orders', 'status', 'active'),
+        dispatched: await countOf('orderTracker_orders', 'status', 'Dispatched'),
+        pushedToOnBuy: await countOf('orderTracker_orders', 'dispatchedToOnbuy', true),
+        needsAttention: await countOf('orderTracker_orders', 'needsAttention', true),
+      },
+      listings: {
+        total: await countOf('orderTracker_listings'),
+        active: await countOf('orderTracker_listings', 'status', 'active'),
+        outOfStock: await countOf('orderTracker_listings', 'status', 'out_of_stock'),
+        suspended: await countOf('orderTracker_listings', 'status', 'suspended'),
+        winningBuyBox: await countOf('orderTracker_listings', 'winningBuyBox', true),
+        tierA: await countOf('orderTracker_listings', 'checkTier', 'A'),
+        tierB: await countOf('orderTracker_listings', 'checkTier', 'B'),
+        tierC: await countOf('orderTracker_listings', 'checkTier', 'C'),
+        tierD: await countOf('orderTracker_listings', 'checkTier', 'D'),
+      },
+      disputes: {
+        total: await countOf('orderTracker_disputes'),
+        open: await countOf('orderTracker_disputes', 'status', 'Open'),
+      },
+      other: {
+        expenses: await countOf('orderTracker_expenses'),
+        clients: await countOf('orderTracker_clients'),
+        bannedBrands: await countOf('orderTracker_bannedBrands'),
+        vaPerformance: await countOf('orderTracker_vaPerformance'),
+        messages: await countOf('orderTracker_messages'),
+      },
+      recentOrders,
     });
   } catch (e) {
-    res.status(500).json({error: e.message});
-  }
-});
-// ============================================
-// FIXED pullOnBuyOrders — bulletproof deduplication
-// ============================================
-exports.pullOnBuyOrders = onRequest({timeoutSeconds: 300, memory: "1GiB"}, async (req, res) => {
-  const { logger } = require("firebase-functions");
-  const db = admin.firestore();
-  const now = admin.firestore.Timestamp.now();
-
-  try {
-    const orgSnap = await db.collection("orderTracker_orgs").get();
-    if (orgSnap.empty) { return res.json({ imported: 0, message: "No orgs configured" }); }
-
-    let totalImported = 0, totalUpdated = 0, totalSkipped = 0;
-
-    for (const orgDoc of orgSnap.docs) {
-      const ORG_ID = orgDoc.id;
-      const account = orgDoc.data();
-
-      if (!account.onbuyApiKey) { logger.info(account.name + ": no API key"); continue; }
-
-      const orders = await fetchOnBuyOrders(account.onbuyApiKey, account);
-      logger.info(account.name + ": fetched " + orders.length + " orders from OnBuy");
-
-      for (const o of orders) {
-        const onbuyOrderId = o.order_number || o.id || o.order_id;
-        if (!onbuyOrderId) { logger.warn("Skipping order with no ID"); continue; }
-
-        const docId = "onbuy_" + String(onbuyOrderId).replace(/[^a-zA-Z0-9_-]/g, "_");
-        const docRef = db.collection("orderTracker_orders").doc(docId);
-        const docSnap = await docRef.get();
-
-        const orderData = {
-          onbuyOrderId: String(onbuyOrderId),
-          orgId: ORG_ID,
-          account: account.name || "Unknown",
-          team: account.teamLabel || (String(account.name).toLowerCase().includes("panacea") ? "panacea" : "samayy"),
-          item: o.product_title || o.item_name || o.title || "Unknown",
-          sku: o.sku || o.product_sku || "",
-          opc: o.opc || o.product_id || "",
-          sellingPrice: Number(o.total || o.price || o.amount || 0),
-          onbuyFee: Number(o.fee || o.commission || 0),
-          amount: Number(o.cost || o.source_price || 0),
-          quantity: Number(o.quantity || o.qty || 1),
-          buyerName: o.buyer_name || o.customer_name || o.name || "",
-          buyerEmail: o.buyer_email || o.email || "",
-          buyerPhone: o.buyer_phone || o.phone || o.telephone || "",
-          buyerAddress: o.buyer_address || o.address || o.shipping_address || "",
-          buyerPostcode: o.buyer_postcode || o.postcode || o.zip || "",
-          status: o.status || "Placed",
-          trackingNumber: o.tracking_number || o.trackingNumber || "",
-          trackingCarrier: o.tracking_carrier || o.trackingCarrier || "",
-          dispatchedToOnbuy: (o.status || "").toLowerCase().includes("dispatch") || (o.status || "").toLowerCase().includes("shipped"),
-          createdAt: o.created_at ? admin.firestore.Timestamp.fromDate(new Date(o.created_at)) : now,
-          updatedAt: now,
-          lastSyncFromOnBuy: now
-        };
-
-        if (docSnap.exists) {
-          const existing = docSnap.data();
-          const changes = {};
-          const historyEntry = { timestamp: now, action: "sync_update", fields: [] };
-
-          const fieldsToCheck = ["status", "trackingNumber", "trackingCarrier", "dispatchedToOnbuy", "buyerPhone", "buyerAddress"];
-          for (const field of fieldsToCheck) {
-            const oldVal = existing[field];
-            const newVal = orderData[field];
-            if (oldVal !== newVal && !(oldVal == null && newVal == null)) {
-              changes[field] = newVal;
-              historyEntry.fields.push({ field: field, from: oldVal, to: newVal });
-            }
-          }
-
-          const wasDispatched = existing.dispatchedToOnbuy === true;
-          const nowShowsUndispatched = !orderData.dispatchedToOnbuy && (existing.status || "").toLowerCase().includes("dispatch");
-          if (wasDispatched && nowShowsUndispatched) {
-            historyEntry.glitchWarning = "OnBuy shows undispatched after dispatch — MANUAL REVIEW NEEDED";
-            historyEntry.fields.push({ field: "status", from: existing.status, to: orderData.status, note: "GLITCH" });
-            delete changes.dispatchedToOnbuy;
-            delete changes.status;
-          }
-
-          if (historyEntry.fields.length > 0) {
-            changes.syncHistory = admin.firestore.FieldValue.arrayUnion(historyEntry);
-            changes.updatedAt = now;
-            changes.lastSyncFromOnBuy = now;
-            await docRef.update(changes);
-            totalUpdated++;
-            logger.info(account.name + ": order " + onbuyOrderId + " updated");
-          } else {
-            totalSkipped++;
-            logger.info(account.name + ": order " + onbuyOrderId + " — no changes");
-          }
-        } else {
-          orderData.syncHistory = [{ timestamp: now, action: "created", source: "pullOnBuyOrders" }];
-          await docRef.set(orderData);
-          totalImported++;
-          logger.info(account.name + ": order " + onbuyOrderId + " CREATED");
-        }
-      }
-    }
-
-    res.json({ 
-      success: true, 
-      imported: totalImported, 
-      updated: totalUpdated, 
-      skipped: totalSkipped,
-      message: "Sync complete: " + totalImported + " new, " + totalUpdated + " updated, " + totalSkipped + " unchanged"
-    });
-  } catch (e) {
-    logger.error("pullOnBuyOrders error:", e);
+    logger.error(`getLiveData error: ${e.message}`);
     res.status(500).json({ error: e.message });
   }
 });
 
+// ---------------------------------------------------------------------------
+// TEST ONBUY AUTH — one browser visit settles Bug #4 with evidence.
+// Usage: /testOnBuyAuth?key=...&account=panacea   (or samayy)
+// Returns which auth style worked + the real response shape of /orders.
+// No secrets are ever returned — only success/failure and field names.
+// ---------------------------------------------------------------------------
+exports.testOnBuyAuth = onRequest(
+  { secrets: ALL_SECRETS, timeoutSeconds: 120 },
+  async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const wanted = (req.query.account || 'panacea').toLowerCase();
+    const account = ACCOUNTS.find(a => a.team === wanted || a.name.toLowerCase() === wanted);
+    if (!account) return res.status(400).json({ error: 'account must be panacea or samayy' });
 
-// ============================================
-// SCRAPINGBEE PRICE CHECKER
-// ============================================
-const getScrapingBeeKey = () => {
-  return process.env.SCRAPINGBEE_API_KEY || '';
-};
+    const report = { account: account.name, authStyleA: null, authStyleB: null, ordersCall: null };
+    let token = null;
 
+    // Style A
+    try {
+      const r = await fetch(`${ONBUY_BASE}/auth/request-token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          consumer_key: account.consumerKey.value(),
+          secret_key: account.secretKey.value(),
+        }),
+      });
+      const j = await r.json().catch(() => ({}));
+      report.authStyleA = { httpStatus: r.status, gotToken: !!j.access_token };
+      if (j.access_token && !token) token = j.access_token;
+    } catch (e) {
+      report.authStyleA = { error: e.message };
+    }
+
+    // Style B (only if A failed)
+    if (!token) {
+      try {
+        const r = await fetch(`${ONBUY_BASE}/auth/request_token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            consumer_key: account.consumerKey.value(),
+            secret_key: account.secretKey.value(),
+          }),
+        });
+        const j = await r.json().catch(() => ({}));
+        report.authStyleB = { httpStatus: r.status, gotToken: !!j.access_token };
+        if (j.access_token) token = j.access_token;
+      } catch (e) {
+        report.authStyleB = { error: e.message };
+      }
+    }
+
+    // If we have a token, probe ALL combos the two old files disagreed on:
+    // path: /orders?site_id= vs /sites/2000/orders  x  header: Bearer vs raw
+    if (token) {
+      const probes = [
+        { name: 'orders_bearer', path: '/orders?site_id=2000&page=1&limit=1', header: `Bearer ${token}` },
+        { name: 'orders_rawToken', path: '/orders?site_id=2000&page=1&limit=1', header: token },
+        { name: 'sitesOrders_bearer', path: '/sites/2000/orders?page=1&limit=1', header: `Bearer ${token}` },
+        { name: 'sitesOrders_rawToken', path: '/sites/2000/orders?page=1&limit=1', header: token },
+      ];
+      report.ordersMatrix = {};
+      for (const p of probes) {
+        try {
+          const r = await fetch(`${ONBUY_BASE}${p.path}`, { headers: { Authorization: p.header } });
+          const j = await r.json().catch(() => ({}));
+          const list = j.results || j.data || j.orders || [];
+          report.ordersMatrix[p.name] = {
+            httpStatus: r.status,
+            topLevelKeys: Object.keys(j).slice(0, 10),
+            listFieldFound: j.results ? 'results' : j.data ? 'data' : j.orders ? 'orders' : 'NONE',
+            sampleOrderKeys: list[0] ? Object.keys(list[0]).slice(0, 20) : [],
+          };
+          if (r.ok && Array.isArray(list) && list.length && !report.winningCombo) {
+            report.winningCombo = {
+              path: p.path.split('?')[0],
+              headerStyle: p.name.endsWith('bearer') ? 'Bearer' : 'raw token',
+            };
+          }
+        } catch (e) {
+          report.ordersMatrix[p.name] = { error: e.message };
+        }
+      }
+    }
+
+    res.json({ success: true, report });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// SCRAPINGBEE — price checking (key-protected now, Bug #7)
+// ---------------------------------------------------------------------------
 const buildScrapingBeeUrl = (targetUrl) => {
   const apiKey = getScrapingBeeKey();
   return `https://app.scrapingbee.com/api/v1/?api_key=${apiKey}&url=${encodeURIComponent(targetUrl)}&render_js=true&premium_proxy=true&country_code=gb`;
@@ -614,8 +834,8 @@ const buildScrapingBeeUrl = (targetUrl) => {
 const extractPrices = (html, platform) => {
   const $ = cheerio.load(html);
   const results = [];
-  const selector = platform === 'amazon' ? '.a-price .a-offscreen' :
-                   platform === 'ebay' ? '.s-item__price' : '[class*="price"]';
+  const selector = platform === 'amazon' ? '.a-price .a-offscreen'
+    : platform === 'ebay' ? '.s-item__price' : '[class*="price"]';
 
   $(selector).each((i, el) => {
     if (i >= 3) return;
@@ -626,10 +846,10 @@ const extractPrices = (html, platform) => {
       if (price > 0 && price < 10000) {
         results.push({
           platform: platform === 'amazon' ? 'Amazon UK' : platform === 'ebay' ? 'eBay UK' : 'AliExpress',
-          price: price,
+          price,
           currency: 'GBP',
           title: platform + ' result ' + (i + 1),
-          link: platform === 'amazon' ? 'https://www.amazon.co.uk' : platform === 'ebay' ? 'https://www.ebay.co.uk' : 'https://www.aliexpress.com'
+          link: platform === 'amazon' ? 'https://www.amazon.co.uk' : platform === 'ebay' ? 'https://www.ebay.co.uk' : 'https://www.aliexpress.com',
         });
       }
     }
@@ -637,126 +857,19 @@ const extractPrices = (html, platform) => {
   return results.slice(0, 2);
 };
 
-// Check source price — supports TWO modes:
-// Mode 1: sourceUrl provided → scrape ONE link (1 API call)
-// Mode 2: query provided → search Amazon/eBay/AliExpress (3 API calls)
-exports.checkSourcePrices = onRequest({cors: true}, async (req, res) => {
-  if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
-
-  const sourceUrl = req.query.sourceUrl || req.body?.sourceUrl;
-  const query = req.query.query || req.query.sku || req.body?.query;
-  const listingId = req.query.listingId || req.body?.listingId;
-  const saveToFirestore = (req.query.saveToFirestore === 'true') || (req.body?.saveToFirestore === true);
-
-  const apiKey = getScrapingBeeKey();
-  if (!apiKey) { res.status(500).json({ error: 'ScrapingBee API key not configured' }); return; }
-
-  try {
-    let response = {};
-
-    // === MODE 1: Direct URL scrape (1 API call) ===
-    if (sourceUrl) {
-      const sbUrl = `https://app.scrapingbee.com/api/v1?api_key=${apiKey}&url=${encodeURIComponent(sourceUrl)}&render_js=true&premium_proxy=true&country_code=gb`;
-      const r = await axios.get(sbUrl, { timeout: 45000 });
-      const extracted = extractSinglePrice(r.data, sourceUrl);
-
-      response = {
-        success: true,
-        mode: 'direct_url',
-        sourceUrl: sourceUrl,
-        price: extracted.price,
-        title: extracted.title,
-        inStock: extracted.inStock,
-        scrapedAt: new Date().toISOString()
-      };
-
-      // Save to Firestore if requested
-      if (saveToFirestore && listingId) {
-        await db.collection('orderTracker_listings').doc(listingId).update({
-          sourcePrice: extracted.price,
-          sourceTitle: extracted.title,
-          sourceInStock: extracted.inStock,
-          sourceCheckedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        response.saved = true;
-      }
-
-      return res.json(response);
-    }
-
-    // === MODE 2: Search across platforms (3 API calls) ===
-    if (!query) {
-      return res.status(400).json({
-        error: 'Missing parameters. Send either sourceUrl (1 API call) or query (3 API calls)',
-        examples: {
-          direct: '/checkSourcePrices?sourceUrl=https://amazon.co.uk/dp/...&listingId=ABC',
-          search: '/checkSourcePrices?query=iphone+15+case&listingId=ABC&saveToFirestore=true'
-        }
-      });
-    }
-
-    const urls = {
-      amazon: `https://www.amazon.co.uk/s?k=${encodeURIComponent(query)}`,
-      ebay: `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(query)}`,
-      aliexpress: `https://www.aliexpress.com/wholesale?SearchText=${encodeURIComponent(query)}`
-    };
-
-    const results = await Promise.allSettled([
-      axios.get(buildScrapingBeeUrl(urls.amazon), { timeout: 45000 }).then(r => extractPrices(r.data, 'amazon')),
-      axios.get(buildScrapingBeeUrl(urls.ebay), { timeout: 45000 }).then(r => extractPrices(r.data, 'ebay')),
-      axios.get(buildScrapingBeeUrl(urls.aliexpress), { timeout: 45000 }).then(r => extractPrices(r.data, 'aliexpress'))
-    ]);
-
-    let all = [];
-    results.forEach(r => { if (r.status === 'fulfilled') all.push(...r.value); });
-    all.sort((a, b) => a.price - b.price);
-    const cheapest = all[0] || null;
-
-    response = {
-      success: true,
-      mode: 'search',
-      searchTerm: query,
-      sources: all,
-      cheapest: cheapest,
-      apiCallsUsed: 3,
-      scrapedAt: new Date().toISOString()
-    };
-
-    if (saveToFirestore && listingId && cheapest) {
-      await db.collection('orderTracker_listings').doc(listingId).update({
-        sourcePrice: cheapest.price,
-        sourcePlatform: cheapest.platform,
-        sourceLink: cheapest.link,
-        sourceTitle: cheapest.title,
-        sourceCheckedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      response.saved = true;
-    }
-
-    res.json(response);
-
-  } catch (err) {
-    console.error('checkSourcePrices error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Helper: Extract price from a single product page
 function extractSinglePrice(html, url) {
   let price = null;
   let title = null;
   let inStock = true;
 
-  // Price patterns
   const pricePatterns = [
     /class="a-price-whole"[^>]*>([\d,]+)/,
-    /class="a-offscreen"[^>]*>£?([\d,\.]+)/,
-    /"priceAmount":\s*([\d\.]+)/,
-    /"price":"£?([\d,\.]+)"/,
-    /data-price="([\d,\.]+)"/,
-    /£([\d,\.]+)/
+    /class="a-offscreen"[^>]*>£?([\d,.]+)/,
+    /"priceAmount":\s*([\d.]+)/,
+    /"price":"£?([\d,.]+)"/,
+    /data-price="([\d,.]+)"/,
+    /£([\d,.]+)/,
   ];
-
   for (const pattern of pricePatterns) {
     const match = html.match(pattern);
     if (match && match[1]) {
@@ -765,47 +878,113 @@ function extractSinglePrice(html, url) {
     }
   }
 
-  // Title
-  const titleMatch = html.match(/<title>([^<]+)/) ||
-                     html.match(/id="productTitle"[^>]*>([^<]+)/) ||
-                     html.match(/"name":"([^"]+)"/);
+  const titleMatch = html.match(/<title>([^<]+)/)
+    || html.match(/id="productTitle"[^>]*>([^<]+)/)
+    || html.match(/"name":"([^"]+)"/);
   if (titleMatch) title = titleMatch[1].trim();
 
-  // Stock check
   if (html.includes('Out of stock') || html.includes('Currently unavailable') || html.includes('Temporarily out of stock')) {
     inStock = false;
   }
-
   return { price, title, inStock };
 }
 
-
-// ============================================
-// NEW: VA MANUAL SOURCE CHECK (Zero API cost)
-// ============================================
-// VA visits the source URL themselves, sees the price, and enters it manually.
-// No ScrapingBee API call. Used while building up the 20,000 listing database.
-exports.manualSourceCheck = onRequest({cors: true}, async (req, res) => {
+// On-demand check. Mode 1: ?sourceUrl= (1 Bee call). Mode 2: ?query= (3 calls).
+exports.checkSourcePrices = onRequest({ cors: true, timeoutSeconds: 120 }, async (req, res) => {
   if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
+  if (!checkAdminKey(req, res)) return;
+
+  const sourceUrl = req.query.sourceUrl || (req.body && req.body.sourceUrl);
+  const query = req.query.query || req.query.sku || (req.body && req.body.query);
+  const listingId = req.query.listingId || (req.body && req.body.listingId);
+  const saveToFirestore = req.query.saveToFirestore === 'true' || (req.body && req.body.saveToFirestore === true);
+
+  const apiKey = getScrapingBeeKey();
+  if (!apiKey) { res.status(500).json({ error: 'SCRAPINGBEE_API_KEY not set in functions/.env' }); return; }
+
+  try {
+    if (sourceUrl) {
+      const r = await axios.get(buildScrapingBeeUrl(sourceUrl), { timeout: 45000 });
+      const extracted = extractSinglePrice(r.data, sourceUrl);
+      const response = {
+        success: true, mode: 'direct_url', sourceUrl,
+        price: extracted.price, title: extracted.title, inStock: extracted.inStock,
+        scrapedAt: new Date().toISOString(),
+      };
+      if (saveToFirestore && listingId) {
+        await db.collection('orderTracker_listings').doc(listingId).set({
+          sourcePrice: extracted.price,
+          sourceTitle: extracted.title,
+          sourceInStock: extracted.inStock,
+          sourceCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+        response.saved = true;
+      }
+      return res.json(response);
+    }
+
+    if (!query) {
+      return res.status(400).json({
+        error: 'Send either sourceUrl (1 Bee call) or query (3 Bee calls)',
+        examples: {
+          direct: '/checkSourcePrices?key=...&sourceUrl=https://amazon.co.uk/dp/...&listingId=ABC',
+          search: '/checkSourcePrices?key=...&query=iphone+15+case&listingId=ABC&saveToFirestore=true',
+        },
+      });
+    }
+
+    const urls = {
+      amazon: `https://www.amazon.co.uk/s?k=${encodeURIComponent(query)}`,
+      ebay: `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(query)}`,
+      aliexpress: `https://www.aliexpress.com/wholesale?SearchText=${encodeURIComponent(query)}`,
+    };
+    const results = await Promise.allSettled([
+      axios.get(buildScrapingBeeUrl(urls.amazon), { timeout: 45000 }).then(r => extractPrices(r.data, 'amazon')),
+      axios.get(buildScrapingBeeUrl(urls.ebay), { timeout: 45000 }).then(r => extractPrices(r.data, 'ebay')),
+      axios.get(buildScrapingBeeUrl(urls.aliexpress), { timeout: 45000 }).then(r => extractPrices(r.data, 'aliexpress')),
+    ]);
+
+    let all = [];
+    results.forEach(r => { if (r.status === 'fulfilled') all.push(...r.value); });
+    all.sort((a, b) => a.price - b.price);
+    const cheapest = all[0] || null;
+
+    const response = {
+      success: true, mode: 'search', searchTerm: query,
+      sources: all, cheapest, apiCallsUsed: 3, scrapedAt: new Date().toISOString(),
+    };
+    if (saveToFirestore && listingId && cheapest) {
+      await db.collection('orderTracker_listings').doc(listingId).set({
+        sourcePrice: cheapest.price,
+        sourcePlatform: cheapest.platform,
+        sourceLink: cheapest.link,
+        sourceTitle: cheapest.title,
+        sourceCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      response.saved = true;
+    }
+    res.json(response);
+  } catch (err) {
+    logger.error(`checkSourcePrices error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// VA manual entry — zero Bee cost.
+exports.manualSourceCheck = onRequest({ cors: true }, async (req, res) => {
+  if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
+  if (!checkAdminKey(req, res)) return;
 
   const { listingId, sourceUrl, sourcePrice, sourceTitle, inStock, checkedBy } = req.body || {};
-
   if (!listingId || sourcePrice === undefined) {
     return res.status(400).json({
-      error: 'Missing required fields: listingId and sourcePrice',
-      example: {
-        listingId: 'Panacea_B07XYZ',
-        sourceUrl: 'https://amazon.co.uk/dp/...',
-        sourcePrice: 12.99,
-        sourceTitle: 'Product name',
-        inStock: true,
-        checkedBy: 'va_name'
-      }
+      error: 'Missing listingId and sourcePrice',
+      example: { listingId: 'Panacea_B07XYZ', sourceUrl: 'https://amazon.co.uk/dp/...', sourcePrice: 12.99, inStock: true, checkedBy: 'va_name' },
     });
   }
 
   try {
-    const updateData = {
+    await db.collection('orderTracker_listings').doc(listingId).set({
       sourceUrl: sourceUrl || '',
       sourcePrice: Number(sourcePrice),
       sourceTitle: sourceTitle || '',
@@ -813,104 +992,63 @@ exports.manualSourceCheck = onRequest({cors: true}, async (req, res) => {
       sourceCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
       sourceCheckedBy: checkedBy || 'va',
       sourceCheckMethod: 'manual',
-      // Initialize tier system fields if not present
       checkTier: 'B',
       checkCount: admin.firestore.FieldValue.increment(1),
       lastPriceChange: null,
-      consecutiveNoChange: 0
-    };
+      consecutiveNoChange: 0,
+    }, { merge: true });
 
-    await db.collection('orderTracker_listings').doc(listingId).update(updateData);
-
-    res.json({
-      success: true,
-      listingId,
-      sourcePrice: Number(sourcePrice),
-      inStock: inStock !== false,
-      method: 'manual',
-      message: 'Manual source check saved. Tier B (24h checks) applied.'
-    });
+    res.json({ success: true, listingId, sourcePrice: Number(sourcePrice), method: 'manual' });
   } catch (err) {
-    console.error('manualSourceCheck error:', err.message);
+    logger.error(`manualSourceCheck error: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
 
-
-// ============================================
-// NEW: UPDATE LISTING SOURCE URL
-// ============================================
-// VA adds or updates the source URL for a listing.
-// Once sourceUrl exists, the scheduled checker will auto-check it.
-exports.updateListingSource = onRequest({cors: true}, async (req, res) => {
+// VA adds/updates a listing's source URL — scheduled checker picks it up.
+exports.updateListingSource = onRequest({ cors: true }, async (req, res) => {
   if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
+  if (!checkAdminKey(req, res)) return;
 
   const { listingId, sourceUrl, sourcePlatform } = req.body || {};
-
   if (!listingId || !sourceUrl) {
     return res.status(400).json({
-      error: 'Missing required fields: listingId and sourceUrl',
-      example: {
-        listingId: 'Panacea_B07XYZ',
-        sourceUrl: 'https://amazon.co.uk/dp/B07XYZ',
-        sourcePlatform: 'amazon'
-      }
+      error: 'Missing listingId and sourceUrl',
+      example: { listingId: 'Panacea_B07XYZ', sourceUrl: 'https://amazon.co.uk/dp/B07XYZ', sourcePlatform: 'amazon' },
     });
   }
 
   try {
-    await db.collection('orderTracker_listings').doc(listingId).update({
-      sourceUrl: sourceUrl,
+    await db.collection('orderTracker_listings').doc(listingId).set({
+      sourceUrl,
       sourcePlatform: sourcePlatform || 'unknown',
       sourceUrlAddedAt: admin.firestore.FieldValue.serverTimestamp(),
       sourceUrlAddedBy: req.body.addedBy || 'va',
-      // Reset tier to B when new source is added
       checkTier: 'B',
       consecutiveNoChange: 0,
-      lastPriceChange: null
-    });
+      lastPriceChange: null,
+    }, { merge: true });
 
-    res.json({
-      success: true,
-      listingId,
-      sourceUrl,
-      message: 'Source URL saved. Scheduled checker will now monitor this listing (Tier B: every 24h).'
-    });
+    res.json({ success: true, listingId, sourceUrl, message: 'Saved. Scheduled checker will monitor it (Tier B: every 24h).' });
   } catch (err) {
-    console.error('updateListingSource error:', err.message);
+    logger.error(`updateListingSource error: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
 
-
-// ============================================
-// NEW: INTELLIGENT TIER SYSTEM
-// ============================================
-// Tier A: Check every 6 hours (price changed recently, hot item)
-// Tier B: Check every 24 hours (default for new listings)
-// Tier C: Check every 72 hours (5 checks, no price change)
-// Tier D: Check every 168 hours / 1 week (10 checks, no price change)
-// Price changes → move UP one tier (D→C→B→A)
-// No change → move DOWN one tier after threshold
-
-const TIER_HOURS = {
-  A: 6,
-  B: 24,
-  C: 72,
-  D: 168
-};
-
-const TIER_THRESHOLDS = {
-  B_to_C: 5,   // 5 checks with no change → move to C
-  C_to_D: 10   // 10 checks with no change → move to D
-};
+// ---------------------------------------------------------------------------
+// TIER SYSTEM — hot listings checked often, dead ones rarely (saves Bee money)
+// A: 6h · B: 24h · C: 72h · D: 168h (1 week)
+// Price change → move UP a tier. No change → drift DOWN after threshold.
+// ---------------------------------------------------------------------------
+const TIER_HOURS = { A: 6, B: 24, C: 72, D: 168 };
+const TIER_THRESHOLDS = { B_to_C: 5, C_to_D: 10 };
 
 function shouldCheckNow(listing) {
   const tier = listing.checkTier || 'B';
   const lastChecked = listing.sourceCheckedAt ? listing.sourceCheckedAt.toDate() : null;
-  if (!lastChecked) return true; // Never checked, check now
-
-  const hoursSince = (Date.now() - lastChecked.getTime()) / (1000 * 60 * 60);
+  if (!lastChecked) return true;
+  const hoursSince = (Date.now() - lastChecked.getTime()) / 36e5;
   return hoursSince >= TIER_HOURS[tier];
 }
 
@@ -919,119 +1057,101 @@ function updateTier(listing, newPrice) {
   const currentTier = listing.checkTier || 'B';
   let newTier = currentTier;
   let consecutiveNoChange = listing.consecutiveNoChange || 0;
-  let lastPriceChange = listing.lastPriceChange;
+  let lastPriceChange = listing.lastPriceChange || null;
+  let priceChanged = false;
 
-  // Price changed → move UP one tier (closer to A)
-  if (oldPrice !== undefined && newPrice !== undefined && Math.abs(oldPrice - newPrice) > 0.01) {
+  if (oldPrice !== undefined && newPrice !== undefined && newPrice !== null
+      && Math.abs(oldPrice - newPrice) > 0.01) {
+    priceChanged = true;
     if (currentTier === 'D') newTier = 'C';
     else if (currentTier === 'C') newTier = 'B';
     else if (currentTier === 'B') newTier = 'A';
     consecutiveNoChange = 0;
     lastPriceChange = admin.firestore.FieldValue.serverTimestamp();
   } else {
-    // No price change → increment counter
     consecutiveNoChange++;
     if (currentTier === 'B' && consecutiveNoChange >= TIER_THRESHOLDS.B_to_C) {
-      newTier = 'C';
-      consecutiveNoChange = 0;
+      newTier = 'C'; consecutiveNoChange = 0;
     } else if (currentTier === 'C' && consecutiveNoChange >= TIER_THRESHOLDS.C_to_D) {
-      newTier = 'D';
-      consecutiveNoChange = 0;
+      newTier = 'D'; consecutiveNoChange = 0;
     }
-    // Tier A stays A (hot items stay hot)
-    // Tier D stays D (cold items stay cold until price changes)
   }
-
-  return { newTier, consecutiveNoChange, lastPriceChange };
+  return { newTier, consecutiveNoChange, lastPriceChange, priceChanged };
 }
 
-
-// ============================================
-// NEW: SCHEDULED SOURCE PRICE CHECKER
-// ============================================
-// Runs every hour. Checks listings that have sourceUrl AND are due based on tier.
-// Only uses 1 API call per listing (direct URL scrape).
+// SCHEDULED — hourly. 1 Bee call per due listing. History only on price change
+// (keeps docs small — old version logged every check forever).
 exports.scheduledCheckSourcePrices = onSchedule(
-  {
-    schedule: 'every 60 minutes',
-    timeoutSeconds: 540, // 9 minutes max
-    memory: '1GiB'
-  },
+  { schedule: 'every 60 minutes', timeoutSeconds: 540, memory: '1GiB' },
   async () => {
     const apiKey = getScrapingBeeKey();
-    if (!apiKey) {
-      logger.error('ScrapingBee API key not configured');
-      return;
-    }
+    if (!apiKey) { logger.error('SCRAPINGBEE_API_KEY not set in functions/.env'); return; }
 
     try {
-      // Get all listings that have a sourceUrl
       const listingsSnap = await db.collection('orderTracker_listings')
         .where('sourceUrl', '>', '')
         .get();
+      if (listingsSnap.empty) { logger.info('No listings with sourceUrl.'); return; }
 
-      if (listingsSnap.empty) {
-        logger.info('No listings with sourceUrl found.');
-        return;
-      }
-
-      const listings = [];
+      const due = [];
       listingsSnap.forEach(doc => {
         const data = doc.data();
         data._docId = doc.id;
-        if (shouldCheckNow(data)) {
-          listings.push(data);
-        }
+        if (shouldCheckNow(data)) due.push(data);
       });
+      logger.info(`${due.length} listings due for source check (of ${listingsSnap.size} with sourceUrl).`);
 
-      logger.info(`Found ${listings.length} listings due for source price check.`);
-
-      // Process in batches of 10 to avoid timeouts
       const BATCH_SIZE = 10;
-      let totalChecked = 0;
-      let totalApiCalls = 0;
-
-      for (let i = 0; i < listings.length; i += BATCH_SIZE) {
-        const batch = listings.slice(i, i + BATCH_SIZE);
-
+      let checked = 0;
+      for (let i = 0; i < due.length; i += BATCH_SIZE) {
+        const batch = due.slice(i, i + BATCH_SIZE);
         await Promise.allSettled(batch.map(async (listing) => {
           try {
-            const sbUrl = `https://app.scrapingbee.com/api/v1?api_key=${apiKey}&url=${encodeURIComponent(listing.sourceUrl)}&render_js=true&premium_proxy=true&country_code=gb`;
-            const r = await axios.get(sbUrl, { timeout: 45000 });
+            const r = await axios.get(buildScrapingBeeUrl(listing.sourceUrl), { timeout: 45000 });
             const extracted = extractSinglePrice(r.data, listing.sourceUrl);
-            totalApiCalls++;
+            const t = updateTier(listing, extracted.price);
 
-            // Update tier based on price change
-            const tierUpdate = updateTier(listing, extracted.price);
-
-            await db.collection('orderTracker_listings').doc(listing._docId).update({
+            const update = {
               sourcePrice: extracted.price,
               sourceTitle: extracted.title,
               sourceInStock: extracted.inStock,
               sourceCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
               sourceCheckMethod: 'auto_scrapingbee',
-              checkTier: tierUpdate.newTier,
-              consecutiveNoChange: tierUpdate.consecutiveNoChange,
-              lastPriceChange: tierUpdate.lastPriceChange || listing.lastPriceChange || null,
-              priceHistory: admin.firestore.FieldValue.arrayUnion({
+              checkTier: t.newTier,
+              consecutiveNoChange: t.consecutiveNoChange,
+              lastPriceChange: t.lastPriceChange,
+            };
+            // History entries ONLY when the price moved — bounded doc growth.
+            if (t.priceChanged) {
+              update.priceHistory = admin.firestore.FieldValue.arrayUnion({
                 price: extracted.price,
                 inStock: extracted.inStock,
                 checkedAt: new Date().toISOString(),
-                tier: tierUpdate.newTier
-              })
-            });
-
-            totalChecked++;
-            logger.info(`Checked ${listing._docId}: £${extracted.price} (Tier ${tierUpdate.newTier})`);
+                tier: t.newTier,
+              });
+            }
+            await db.collection('orderTracker_listings').doc(listing._docId).update(update);
+            checked++;
+            logger.info(`${listing._docId}: £${extracted.price} (Tier ${t.newTier})`);
           } catch (err) {
-            logger.error(`Failed checking ${listing._docId}: ${err.message}`);
+            logger.error(`Check failed ${listing._docId}: ${err.message}`);
           }
         }));
       }
-
-      logger.info(`Source price check complete: ${totalChecked} checked, ${totalApiCalls} API calls used.`);
+      logger.info(`Source check complete: ${checked} checked.`);
     } catch (err) {
-      logger.error('scheduledCheckSourcePrices error:', err.message);
+      logger.error(`scheduledCheckSourcePrices error: ${err.message}`);
     }
   }
 );
+
+// ============================================================================
+// INTENTIONALLY REMOVED (legacy — Firebase will offer to delete these, type Y):
+//   migrateAll, migrateOrders, migrateListings (v1, one-time, already ran)
+//   migrateData (open collection copier — security risk)
+//   cleanupDuplicates (one-time, already ran 21 Jul)
+//   testScrapingBee (debug tool, no longer needed)
+//   getLiveDataV2 (reborn as the read-only getLiveData API above)
+//   sendSignupCode, verifySignupCode (signup flow not in use)
+//   pullOnBuyListingsHourly (replaced by paginated pullOnBuyListings above)
+// ============================================================================
