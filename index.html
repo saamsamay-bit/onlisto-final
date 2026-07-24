@@ -1167,6 +1167,25 @@
                     <h4 id="combinedFeesTotal">£0.00</h4>
                     <p class="mute"><span id="combinedFeeCount">0</span> orders total</p>
                 </div>
+
+            <!-- TOTAL SELLING FEES BANNER -->
+            <div class="card anim-fadeUp d1" style="margin-bottom:18px;background:linear-gradient(135deg,#fef2f2,#fff5f5);border:2px solid #fecaca">
+                <div class="card-head" style="margin-bottom:0">
+                    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+                        <div style="width:52px;height:52px;border-radius:14px;background:linear-gradient(135deg,#dc2626,#ef4444);display:grid;place-items:center;box-shadow:0 8px 16px -6px rgba(239,68,68,.4)">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                        </div>
+                        <div>
+                            <h2 style="margin:0;font-size:20px;font-weight:900;color:#991b1b">Total OnBuy Selling Fees</h2>
+                            <div class="sub" style="color:#b91c1c;font-weight:600">All fees collected by OnBuy across every order</div>
+                        </div>
+                        <div style="margin-left:auto;text-align:right">
+                            <div id="totalSellingFeesDisplay" style="font-size:32px;font-weight:900;color:#dc2626;letter-spacing:-1px">£0.00</div>
+                            <div id="totalSellingFeesMeta" style="font-size:12px;font-weight:700;color:#991b1b">0 orders · avg £0.00 per order</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
             </div>
 
             <div class="card anim-fadeUp d2">
@@ -3255,6 +3274,11 @@ async function saveSplitPercentages(){
                 $('samayyFeeCount').textContent = sCount;
                 $('combinedFeesTotal').textContent = fmt(pTotal + sTotal);
                 $('combinedFeeCount').textContent = (pCount + sCount);
+                // Update the prominent Total Selling Fees banner
+                const totalFees = pTotal + sTotal;
+                const totalCount = pCount + sCount;
+                $('totalSellingFeesDisplay').textContent = fmt(totalFees);
+                $('totalSellingFeesMeta').textContent = totalCount + ' orders · avg ' + fmt(totalCount > 0 ? totalFees / totalCount : 0) + ' per order';
                 // Show/hide combined card based on role
                 $('combinedFeesMini').style.display = (currentRole === 'admin') ? '' : 'none';
                 // For VA, lock the filter to their account
@@ -3295,6 +3319,18 @@ async function saveSplitPercentages(){
                     <td class="small muted">${date}</td>
                 </tr>`;
             });
+            if (html && rows.length > 0) {
+                const totalFeesSum = rows.reduce((sum, o) => sum + (o.onbuyFee || 0), 0);
+                const totalSalesSum = rows.reduce((sum, o) => sum + (o.sellingPrice || 0), 0);
+                const avgFeePct = totalSalesSum > 0 ? ((totalFeesSum / totalSalesSum) * 100).toFixed(1) : '0.0';
+                html += `<tr style="background:linear-gradient(135deg,#fef2f2,#fff5f5);border-top:2px solid #fecaca;font-weight:800">
+                    <td colspan="3" style="text-align:right;padding:14px;color:#991b1b;font-size:14px">TOTAL FOR THIS VIEW</td>
+                    <td class="num" style="color:var(--blue);font-size:15px">${fmt(totalSalesSum)}</td>
+                    <td class="num" style="color:var(--red);font-size:15px">${fmt(totalFeesSum)}</td>
+                    <td class="num" style="color:var(--red);font-size:15px">${avgFeePct}%</td>
+                    <td></td>
+                </tr>`;
+            }
             $('feesTableBody').innerHTML = html || '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">No fees found for this filter.</td></tr>';
             // Pagination
             const totalPages = Math.ceil(rows.length / FEES_PER_PAGE);
