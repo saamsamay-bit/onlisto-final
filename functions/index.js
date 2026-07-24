@@ -22,8 +22,12 @@
  *  #8 migrateData removed (open collection copier). Legacy one-time jobs
  *     intentionally NOT in this file — they get deleted on deploy.
  *  #9 /orders IGNORES page=N (24 Jul 2026) — import + dispatch-sync passes
- *     now paginate with limit+offset like /listings. Ghost orders (dispatched
- *     on OnBuy but stuck 'active' on dashboard) are detected and flipped.
+ *     now paginate with limit+offset like /listings.
+ * #10 UNFILTERED /orders only returns AWAITING orders (24 Jul 2026, proven
+ *     live: syncScanned == exact awaiting count). Dispatch-sync must query
+ *     filter[status]=dispatched explicitly — this was the true root of the
+ *     ghost-orders bug (dispatched on OnBuy, stuck 'active' on dashboard).
+ *     Cancelled orders now flag needsAttention for human review.
  *
  * STILL TO VERIFY WITH ONE REAL CALL (testOnBuyAuth does this):
  *  - Which OnBuy auth style the live API actually accepts
@@ -272,6 +276,12 @@ async function syncStatusFromOnBuy(account, o) {
   if ((ex.onbuyStatus || '') !== onbuyStatus) updates.onbuyStatus = onbuyStatus;
 
   const currentStatus = String(ex.status || '');
+  // Cancelled on OnBuy → flag for a human, never auto-change status.
+  if (s.includes('cancel') && currentStatus !== 'Cancelled' && !ex.needsAttention) {
+    updates.needsAttention = true;
+    updates.attentionReason = `OnBuy shows: ${onbuyStatus}`;
+  }
+
   const alreadyHandled = currentStatus.toLowerCase() === 'dispatched' || currentStatus === 'Cancelled';
   if (onbuySaysDispatched && !alreadyHandled) {
     updates.status = 'Dispatched';
@@ -281,7 +291,9 @@ async function syncStatusFromOnBuy(account, o) {
 
   if (Object.keys(updates).length > 1) {
     await ref.update(updates);
-    return updates.status === 'Dispatched' ? 'dispatched' : 'synced';
+    if (updates.status === 'Dispatched') return 'dispatched';
+    if (updates.needsAttention) return 'attention';
+    return 'synced';
   }
   return 'unchanged';
 }
@@ -315,23 +327,21 @@ async function pullOrdersForAccount(account, fullRescan) {
     if (orders.length < 100) break; // last page
   }
 
-  // Dispatch sync pass: recent orders of ANY status. Dispatched orders vanish
-  // from the awaiting filter — this is how the dashboard learns about them.
-  // OnBuy quirk #2 (proven 23 Jul 2026): "updated" is an INVALID sort field
-  // (HTTP 400) — "created" is the valid one. Wrapped so a failure here can
-  // never swallow the import results above.
+  // Dispatch sync pass. OnBuy quirk #2 (proven 23 Jul 2026): "updated" is an
+  // INVALID sort field (HTTP 400) — "created" is the valid one. Wrapped so a
+  // failure here can never swallow the import results above.
   try {
-    // BUG FIX 24 Jul 2026: this used page=1&limit=100 — OnBuy ignores page=,
-    // so only the newest handful of orders was ever scanned. Dispatched
-    // orders older than that were never seen and stayed 'active' forever
-    // (the 22-vs-12 ghost orders bug). Now paginates with offset like
-    // /listings (proven working on 21k listings) and reports how many were
-    // scanned so getLiveData/manual pulls can prove coverage.
+    // BUG FIX 24 Jul 2026 (two parts):
+    //  a) page=1&limit=100 — OnBuy ignores page=, only offset paginates.
+    //  b) UNFILTERED /orders only returns AWAITING orders (proven live:
+    //     syncScanned equalled the exact awaiting count). Dispatched orders
+    //     NEVER appear there — must ask with filter[status]=dispatched.
+    //     This was the true root of the 22-vs-12 ghost orders bug.
     let scanned = 0;
-    for (let offset = 0; offset < 500; offset += 100) {
+    for (let offset = 0; offset < 300; offset += 100) {
       const recent = await onbuyGet(token,
-        `/orders?site_id=2000&sort[created]=desc&limit=100&offset=${offset}`);
-      const list = extractList(recent, `recent orders offset ${offset} (${account.name})`);
+        `/orders?site_id=2000&filter[status]=dispatched&sort[created]=desc&limit=100&offset=${offset}`);
+      const list = extractList(recent, `dispatched orders offset ${offset} (${account.name})`);
       if (!list.length) break;
       scanned += list.length;
       for (const o of list) {
@@ -341,6 +351,14 @@ async function pullOrdersForAccount(account, fullRescan) {
       if (list.length < 100) break; // last page
     }
     counts.syncScanned = scanned;
+
+    // Cancelled orders: flag for a human (needsAttention), never auto-change.
+    const cancelled = await onbuyGet(token,
+      `/orders?site_id=2000&filter[status]=cancelled&sort[created]=desc&limit=100&offset=0`);
+    for (const o of extractList(cancelled, `cancelled orders (${account.name})`)) {
+      const r = await syncStatusFromOnBuy(account, o);
+      if (r === 'attention') counts.cancelFlagged = (counts.cancelFlagged || 0) + 1;
+    }
   } catch (e) {
     logger.error(`recent-orders sync failed (${account.name}): ${e.message}`);
     counts.dispatchSyncError = e.message;
