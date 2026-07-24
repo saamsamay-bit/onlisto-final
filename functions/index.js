@@ -21,6 +21,9 @@
  *     ?key=ADMIN_KEY (was open to the whole internet burning Bee credits)
  *  #8 migrateData removed (open collection copier). Legacy one-time jobs
  *     intentionally NOT in this file — they get deleted on deploy.
+ *  #9 /orders IGNORES page=N (24 Jul 2026) — import + dispatch-sync passes
+ *     now paginate with limit+offset like /listings. Ghost orders (dispatched
+ *     on OnBuy but stuck 'active' on dashboard) are detected and flipped.
  *
  * STILL TO VERIFY WITH ONE REAL CALL (testOnBuyAuth does this):
  *  - Which OnBuy auth style the live API actually accepts
@@ -291,11 +294,15 @@ async function pullOrdersForAccount(account, fullRescan) {
   const exportedFilter = fullRescan ? '' : '&filter[previously_exported]=0';
   const counts = { imported: 0, synced: 0, unchanged: 0, skipped: 0, dispatchedSynced: 0 };
 
-  // Paginate: awaiting_dispatch is usually small, but never assume one page.
-  for (let page = 1; page <= 10; page++) {
+  // OnBuy quirk #3 (PROVEN 24 Jul 2026): /orders IGNORES page=N — only
+  // limit+offset paginate (same as /listings). Import loop keeps offset=0
+  // because OnBuy marks orders exported on read, so each call returns the
+  // next batch; full-rescan mode must paginate with real offsets instead.
+  for (let batch = 0; batch < 10; batch++) {
+    const offset = fullRescan ? batch * 100 : 0;
     const json = await onbuyGet(token,
-      `/orders?site_id=2000&filter[status]=awaiting_dispatch${exportedFilter}&sort[created]=asc&page=${page}&limit=100`);
-    const orders = extractList(json, `orders page ${page} (${account.name})`);
+      `/orders?site_id=2000&filter[status]=awaiting_dispatch${exportedFilter}&sort[created]=asc&limit=100&offset=${offset}`);
+    const orders = extractList(json, `orders batch ${batch} (${account.name})`);
     if (!orders.length) break;
 
     for (const o of orders) {
@@ -314,11 +321,26 @@ async function pullOrdersForAccount(account, fullRescan) {
   // (HTTP 400) — "created" is the valid one. Wrapped so a failure here can
   // never swallow the import results above.
   try {
-    const recent = await onbuyGet(token, `/orders?site_id=2000&sort[created]=desc&page=1&limit=100`);
-    for (const o of extractList(recent, `recent orders (${account.name})`)) {
-      const r = await syncStatusFromOnBuy(account, o);
-      if (r === 'dispatched') counts.dispatchedSynced++;
+    // BUG FIX 24 Jul 2026: this used page=1&limit=100 — OnBuy ignores page=,
+    // so only the newest handful of orders was ever scanned. Dispatched
+    // orders older than that were never seen and stayed 'active' forever
+    // (the 22-vs-12 ghost orders bug). Now paginates with offset like
+    // /listings (proven working on 21k listings) and reports how many were
+    // scanned so getLiveData/manual pulls can prove coverage.
+    let scanned = 0;
+    for (let offset = 0; offset < 500; offset += 100) {
+      const recent = await onbuyGet(token,
+        `/orders?site_id=2000&sort[created]=desc&limit=100&offset=${offset}`);
+      const list = extractList(recent, `recent orders offset ${offset} (${account.name})`);
+      if (!list.length) break;
+      scanned += list.length;
+      for (const o of list) {
+        const r = await syncStatusFromOnBuy(account, o);
+        if (r === 'dispatched') counts.dispatchedSynced++;
+      }
+      if (list.length < 100) break; // last page
     }
+    counts.syncScanned = scanned;
   } catch (e) {
     logger.error(`recent-orders sync failed (${account.name}): ${e.message}`);
     counts.dispatchSyncError = e.message;
