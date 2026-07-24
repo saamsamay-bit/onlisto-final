@@ -384,6 +384,27 @@
             .orders-section{width:100%}
             .two-col{grid-template-columns:1fr}
         }
+        /* ===== Privacy Mode (added 24 Jul 2026) — blur account names + buyer PII for screen recording ===== */
+        body.privacy-on .badge-panacea,
+        body.privacy-on .badge-samayy,
+        body.privacy-on #ordersTableBody td:nth-child(3),
+        body.privacy-on .role-toggle,
+        body.privacy-on #adminFilterDiv {
+            filter: blur(7px);
+            user-select: none;
+        }
+        body.privacy-on .badge-panacea,
+        body.privacy-on .badge-samayy,
+        body.privacy-on .role-toggle,
+        body.privacy-on #adminFilterDiv { pointer-events: none; }
+        /* Hide account names in KPI cards when privacy is on */
+        body.privacy-on .privacy-hide-name { display: none !important; }
+        body.privacy-on .privacy-blur-text { filter: blur(6px); pointer-events: none; user-select: none; }#privacyBtn { transition: all .2s ease; }
+        body.privacy-on #privacyBtn {
+            background: var(--green, #16a34a) !important;
+            color: #fff !important;
+            font-weight: 800;
+        }
     </style>
 </head>
 <body>
@@ -670,12 +691,33 @@
                 <button id="navDisputes" onclick="switchTab('disputes')">Disputes</button>
                 <button id="navVa" onclick="switchTab('va')">VA Stats</button>
                 <button id="navClients" onclick="switchTab('clients')">Clients</button>
+                <button id="navFees" onclick="switchTab('fees')">OnBuy Fees</button>
             </div>
+            <button id="privacyBtn" class="logout-btn" onclick="togglePrivacy()" title="Hide account names + buyer details (for screen recording)">🎥 Privacy</button>
             <div class="live"><span class="live-dot"></span>LIVE</div>
             <span class="user-chip" id="userChip">Super Admin</span>
             <button class="logout-btn" onclick="logout()" title="Log out">Log out</button>
         </div>
     </nav>
+
+    <script>
+    /* ===== Privacy Mode toggle (24 Jul 2026) — persists via localStorage ===== */
+    window.togglePrivacy = function() {
+        var on = document.body.classList.toggle('privacy-on');
+        try { localStorage.setItem('privacyMode', on ? '1' : '0'); } catch (e) {}
+        var b = document.getElementById('privacyBtn');
+        if (b) b.textContent = on ? '🎥 Privacy ON' : '🎥 Privacy';
+    };
+    (function() {
+        try {
+            if (localStorage.getItem('privacyMode') === '1') {
+                document.body.classList.add('privacy-on');
+                var b = document.getElementById('privacyBtn');
+                if (b) b.textContent = '🎥 Privacy ON';
+            }
+        } catch (e) {}
+    })();
+    </script>
 
     <main class="container">
 
@@ -1106,6 +1148,60 @@
                 </div>
             </div>
         </section>
+
+        <!-- ================= ONBUY FEES TAB ================= -->
+        <section id="feesTab" class="hidden">
+            <div class="mini-grid anim-fadeUp">
+                <div class="mini">
+                    <p><span class="privacy-hide-name">Panacea </span>OnBuy Fees</p>
+                    <h4 id="panaceaFeesTotal">£0.00</h4>
+                    <p class="mute"><span id="panaceaFeeCount">0</span> orders with fees</p>
+                </div>
+                <div class="mini">
+                    <p><span class="privacy-hide-name">Samayy </span>OnBuy Fees</p>
+                    <h4 id="samayyFeesTotal">£0.00</h4>
+                    <p class="mute"><span id="samayyFeeCount">0</span> orders with fees</p>
+                </div>
+                <div class="mini" id="combinedFeesMini">
+                    <p>Combined OnBuy Fees</p>
+                    <h4 id="combinedFeesTotal">£0.00</h4>
+                    <p class="mute"><span id="combinedFeeCount">0</span> orders total</p>
+                </div>
+            </div>
+
+            <div class="card anim-fadeUp d2">
+                <div class="card-head">
+                    <div>
+                        <h2>OnBuy Fees Breakdown</h2>
+                        <div class="sub">Every order with an OnBuy fee — filter by account, sort by date</div>
+                    </div>
+                    <div class="filters">
+                        <select id="feesAccountFilter" onchange="renderFeesTable()">
+                            <option value="all">All Accounts</option>
+                            <option value="panacea">Panacea</option>
+                            <option value="samayy">Samayy</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Order ID</th>
+                                <th>Account</th>
+                                <th>Product</th>
+                                <th class="num">Sale Price</th>
+                                <th class="num">OnBuy Fee</th>
+                                <th class="num">Fee %</th>
+                                <th>Date</th>
+                            </tr>
+                        </thead>
+                        <tbody id="feesTableBody"></tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="feesPagination"></div>
+            </div>
+        </section>
     </main>
 
     <script type="module">
@@ -1378,9 +1474,9 @@
         }
 
         /* ================= TABS ================= */
-        const TABS = ['orders', 'listings', 'hero', 'disputes', 'va', 'clients'];
+        const TABS = ['orders', 'listings', 'hero', 'disputes', 'va', 'clients', 'fees'];
         window.switchTab = function(tab) {
-            if (tab === 'clients' && !isAdmin()) { toast('Clients area is Super Admin only.', 'error'); return; }
+            if ((tab === 'clients' || tab === 'fees') && !isAdmin()) { toast('Clients area is Super Admin only.', 'error'); return; }
             TABS.forEach(t => $(t + 'Tab').classList.toggle('hidden', t !== tab));
             $('navOrders').classList.toggle('active', tab === 'orders');
             $('navListings').classList.toggle('active', tab === 'listings');
@@ -1388,6 +1484,7 @@
             $('navDisputes').classList.toggle('active', tab === 'disputes');
             $('navVa').classList.toggle('active', tab === 'va');
             $('navClients').classList.toggle('active', tab === 'clients');
+            $('navFees').classList.toggle('active', tab === 'fees');
             const panel = $(tab + 'Tab');
             panel.style.animation = 'none'; void panel.offsetWidth; panel.style.animation = '';
             if (tab === 'listings' && lastVisible === null && pageHistory.length === 0 && !searchActive) loadListings('initial');
@@ -3123,7 +3220,114 @@ async function saveSplitPercentages(){
         function saaRefreshBadge() {
             // badge counts come from the inbox listener; this just re-renders visibility
         }
-        window.saaBoot = function() {
+        
+        /* ================= ONBUY FEES TAB ================= */
+        let feesData = [], feesPage = 0, FEES_PER_PAGE = 50;
+
+        window.loadFees = async function() {
+            const acc = vaAccount();
+            const scope = listScope();
+            let q;
+            if (acc) {
+                q = query(collection(db, "orderTracker_orders"), where("team", "==", acc), orderBy("createdAt", "desc"), limit(5000));
+            } else if (scope) {
+                q = query(collection(db, "orderTracker_orders"), where("team", "==", scope), orderBy("createdAt", "desc"), limit(5000));
+            } else {
+                q = query(collection(db, "orderTracker_orders"), orderBy("createdAt", "desc"), limit(5000));
+            }
+            try {
+                const snap = await getDocs(q);
+                feesData = [];
+                let pTotal = 0, pCount = 0, sTotal = 0, sCount = 0;
+                snap.forEach(d => {
+                    const o = d.data();
+                    const fee = Number(o.onbuyFee) || 0;
+                    const price = Number(o.sellingPrice) || 0;
+                    if (fee > 0) {
+                        feesData.push({ id: d.id, ...o, onbuyFee: fee, sellingPrice: price });
+                        if (o.team === 'panacea' || (o.account || '').toLowerCase().includes('panacea')) { pTotal += fee; pCount++; }
+                        else if (o.team === 'samayy' || (o.account || '').toLowerCase().includes('samay')) { sTotal += fee; sCount++; }
+                    }
+                });
+                $('panaceaFeesTotal').textContent = fmt(pTotal);
+                $('panaceaFeeCount').textContent = pCount;
+                $('samayyFeesTotal').textContent = fmt(sTotal);
+                $('samayyFeeCount').textContent = sCount;
+                $('combinedFeesTotal').textContent = fmt(pTotal + sTotal);
+                $('combinedFeeCount').textContent = (pCount + sCount);
+                // Show/hide combined card based on role
+                $('combinedFeesMini').style.display = (currentRole === 'admin') ? '' : 'none';
+                // For VA, lock the filter to their account
+                if (acc) {
+                    $('feesAccountFilter').value = acc;
+                    $('feesAccountFilter').disabled = true;
+                } else {
+                    $('feesAccountFilter').disabled = false;
+                }
+                renderFeesTable();
+            } catch (e) { console.error('loadFees:', e); toast('Could not load fees: ' + e.message, 'error'); }
+        };
+
+        window.renderFeesTable = function() {
+            const filter = $('feesAccountFilter').value;
+            let rows = feesData;
+            if (filter !== 'all') {
+                rows = feesData.filter(o => o.team === filter || (o.account || '').toLowerCase().includes(filter === 'panacea' ? 'panacea' : 'samay'));
+            }
+            // For VA, force their account
+            const acc = vaAccount();
+            if (acc) rows = rows.filter(o => o.team === acc || (o.account || '').toLowerCase().includes(acc === 'panacea' ? 'panacea' : 'samay'));
+
+            const start = feesPage * FEES_PER_PAGE;
+            const page = rows.slice(start, start + FEES_PER_PAGE);
+            let html = '';
+            page.forEach(o => {
+                const pct = o.sellingPrice > 0 ? ((o.onbuyFee / o.sellingPrice) * 100).toFixed(1) : '0.0';
+                const date = o.createdAt ? (o.createdAt.toDate ? o.createdAt.toDate().toLocaleDateString('en-GB') : new Date(o.createdAt).toLocaleDateString('en-GB')) : 'N/A';
+                const isPan = o.team === 'panacea' || (o.account || '').toLowerCase().includes('panacea');
+                html += `<tr>
+                    <td><span class="mono">${esc(o.onbuyOrderId || o.orderNo || o.id)}</span></td>
+                    <td><span class="badge ${isPan ? 'badge-panacea' : 'badge-samayy'}">${esc(o.account || o.team || 'N/A')}</span></td>
+                    <td class="small">${esc(o.item || o.title || 'Unknown')}</td>
+                    <td class="num" style="font-weight:800">${fmt(o.sellingPrice)}</td>
+                    <td class="num" style="font-weight:800;color:var(--red)">${fmt(o.onbuyFee)}</td>
+                    <td class="num">${pct}%</td>
+                    <td class="small muted">${date}</td>
+                </tr>`;
+            });
+            $('feesTableBody').innerHTML = html || '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">No fees found for this filter.</td></tr>';
+            // Pagination
+            const totalPages = Math.ceil(rows.length / FEES_PER_PAGE);
+            $('feesPagination').innerHTML = totalPages > 1
+                ? `<button class="btn btn-soft btn-sm" onclick="prevFeesPage()" ${feesPage === 0 ? 'disabled' : ''}>← Prev</button>
+                   <span style="font-size:13px;font-weight:800;color:var(--muted)">Page ${feesPage + 1} of ${totalPages}</span>
+                   <button class="btn btn-soft btn-sm" onclick="nextFeesPage()" ${feesPage >= totalPages - 1 ? 'disabled' : ''}>Next →</button>`
+                : '';
+        };
+
+        window.prevFeesPage = function() { if (feesPage > 0) { feesPage--; renderFeesTable(); } };
+        window.nextFeesPage = function() { feesPage++; renderFeesTable(); };
+
+        /* ================= ENHANCED PRIVACY MODE ================= */
+        window.togglePrivacy = function() {
+            var on = document.body.classList.toggle('privacy-on');
+            try { localStorage.setItem('privacyMode', on ? '1' : '0'); } catch (e) {}
+            var b = document.getElementById('privacyBtn');
+            if (b) b.textContent = on ? '🎥 Privacy ON' : '🎥 Privacy';
+            // Also update KPI card labels
+            const panLabel = document.querySelector('#pnlSection .kpi:nth-child(3) p');
+            const samLabel = document.querySelector('#pnlSection .kpi:nth-child(4) p');
+            if (panLabel) {
+                if (on) { if (!panLabel.dataset.orig) panLabel.dataset.orig = panLabel.innerHTML; panLabel.innerHTML = 'VA SPLIT · <input type="number" id="panaceaPercent" value="30" min="0" max="100" style="width:40px;text-align:center;border:1px solid #cbd5e1;border-radius:4px;padding:2px;font-size:12px;font-weight:700;">% <button class="btn btn-primary btn-sm" onclick="saveSplitPercentages()" style="margin-left:6px;font-size:11px;padding:4px 10px">Save %</button>'; }
+                else if (panLabel.dataset.orig) panLabel.innerHTML = panLabel.dataset.orig;
+            }
+            if (samLabel) {
+                if (on) { if (!samLabel.dataset.orig) samLabel.dataset.orig = samLabel.innerHTML; samLabel.innerHTML = 'VA SPLIT · <input type="number" id="samayyPercent" value="20" min="0" max="100" style="width:40px;text-align:center;border:1px solid #cbd5e1;border-radius:4px;padding:2px;font-size:12px;font-weight:700;">% <button id="saveSplitBtn" class="btn btn-primary btn-sm" onclick="saveSplitPercentages()" style="margin-left:6px;font-size:11px;padding:4px 10px">Save %</button>'; }
+                else if (samLabel.dataset.orig) samLabel.innerHTML = samLabel.dataset.orig;
+            }
+        };
+
+window.saaBoot = function() {
             $('saaThreadPick').style.display = currentRole === 'admin' ? 'block' : 'none';
             if (saaInboxUnsub) saaInboxUnsub();
             saaInboxUnsub = onSnapshot(query(collection(db, "orderTracker_messages"), where("toRole", "==", currentRole), limit(200)),
