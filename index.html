@@ -764,6 +764,12 @@
                     </div>
                     <div><p>SAMAYY VA SPLIT · <input type="number" id="samayyPercent" value="20" min="0" max="100" style="width:40px;text-align:center;border:1px solid #cbd5e1;border-radius:4px;padding:2px;font-size:12px;font-weight:700;">% <button id="saveSplitBtn" class="btn btn-primary btn-sm" onclick="saveSplitPercentages()" style="margin-left:6px;font-size:11px;padding:4px 10px">Save %</button></p><h3 id="samayySplit">£0.00</h3></div>
                 </div>
+                <div class="kpi anim-fadeUp d5">
+                    <div class="kpi-ic" style="--c1:#dc2626;--c2:#ef4444">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                    </div>
+                    <div><p>Total OnBuy Selling Fees</p><h3 id="totalOnBuyFees">£0.00</h3></div>
+                </div>
             </div>
             <p class="pnl-note" id="pnlNote">Live server-side sums across ALL orders — not just the latest 50.</p>
 
@@ -1773,14 +1779,16 @@
                 const srcFee = (d.costs || 0) * pct / 100;
                 animateValue($('totalSales'), d.sales || 0);
                 animateValue($('netProfit'), profitOf(d) - srcFee - expAll);
+                animateValue($('totalOnBuyFees'), d.fees || 0);
                 notes.push(f === 'All Accounts' ? 'Live server-side sums across ALL orders.' : `Live server-side sums across all ${f} orders.`);
                 if (pct > 0 || expAll > 0) notes.push(`Net Profit is after deductions — sourcing fee ${pct}% (−${fmt(srcFee)})${expAll > 0 ? ` and expenses (−${fmt(expAll)})` : ''}.`);
             } catch (e) {
                 console.error('P&L totals aggregation error:', e);
-                let s = 0, p = 0, c = 0;
-                getVisibleOrders().forEach(o => { const sale = Number(o.sellingPrice) || 0; const cost = Number(o.amount) || 0; s += sale; c += cost; p += sale - (Number(o.onbuyFee) || 0) - cost; });
+                let s = 0, p = 0, c = 0, f = 0;
+                getVisibleOrders().forEach(o => { const sale = Number(o.sellingPrice) || 0; const cost = Number(o.amount) || 0; const fee = Number(o.onbuyFee) || 0; s += sale; c += cost; f += fee; p += sale - fee - cost; });
                 animateValue($('totalSales'), s);
                 animateValue($('netProfit'), p - (c * pct / 100) - expAll);
+                animateValue($('totalOnBuyFees'), f);
                 const link = indexLink(e);
                 notes.push(`⚙️ <b>One-time setup needed:</b> totals currently use the latest 50 orders.` + (link ? ` <a href="${link}" target="_blank" style="color:var(--indigo);font-weight:800">Click here, sign into Firebase & press “Create index”</a> — it builds in ~2 minutes, then this card switches to live all-time totals automatically.` : ''));
                 if (pct > 0 || expAll > 0) notes.push(`Net Profit is after deductions — sourcing fee ${pct}% (−${fmt(c * pct / 100)})${expAll > 0 ? ` and expenses (−${fmt(expAll)})` : ''}.`);
