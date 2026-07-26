@@ -1279,6 +1279,68 @@ exports.scheduledCheckSourcePrices = onSchedule(
   }
 );
 
+// ---------------------------------------------------------------------------
+// PROBE ONBUY DATA (pipeline #10, 25 Jul 2026) — evidence dump, no guessing.
+// Answers: does the API expose disputes? refunds? what does a FULL single
+// order contain (all fields)? what do cancelled/dispatched orders carry?
+//   /probeOnBuyData?key=...&account=samayy&orderId=T6MD55X
+// Read-only. Returns field names + tiny samples — never secrets, never PII.
+// ---------------------------------------------------------------------------
+exports.probeOnBuyData = onRequest(
+  { secrets: ALL_SECRETS, timeoutSeconds: 120 },
+  async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const wanted = (req.query.account || 'samayy').toLowerCase();
+    const account = ACCOUNTS.find(a => a.team === wanted || a.name.toLowerCase() === wanted);
+    if (!account) return res.status(400).json({ error: 'account must be panacea or samayy' });
+    const orderId = String(req.query.orderId || '');
+
+    const report = { account: account.name, probes: {} };
+
+    const probe = async (name, path) => {
+      try {
+        const token = await getOnBuyToken(account.consumerKey.value(), account.secretKey.value());
+        const r = await fetch(`${ONBUY_BASE}${path}`, { headers: { Authorization: token } });
+        const j = await r.json().catch(() => ({}));
+        const list = j.results || j.data || null;
+        report.probes[name] = {
+          httpStatus: r.status,
+          topLevelKeys: Object.keys(j).slice(0, 12),
+          rowCount: Array.isArray(list) ? list.length : null,
+          firstRowAllKeys: Array.isArray(list) && list[0] ? Object.keys(list[0]) : (j.order ? Object.keys(j.order) : []),
+          metadata: j.metadata || null,
+        };
+        // For single-order probe: dump the whole order minus buyer PII
+        if (name === 'singleOrder' && r.ok) {
+          const o = j.order || (Array.isArray(list) && list[0]) || j;
+          const clean = {};
+          for (const [k, v] of Object.entries(o)) {
+            if (/name|address|phone|email|postcode|delivery/i.test(k)) { clean[k] = '[PII stripped]'; continue; }
+            clean[k] = (v !== null && typeof v === 'object') ? JSON.stringify(v).slice(0, 400) : v;
+          }
+          report.probes[name].fullOrder = clean;
+        }
+      } catch (e) {
+        report.probes[name] = { error: e.message };
+      }
+    };
+
+    // Candidate endpoints — OnBuy docs are a Postman collection; status codes tell the truth.
+    await probe('refundedOrders', '/orders?site_id=2000&filter[status]=refunded&limit=2&offset=0');
+    await probe('cancelledOrders', '/orders?site_id=2000&filter[status]=cancelled&sort[created]=desc&limit=2&offset=0');
+    await probe('dispatchedOrders', '/orders?site_id=2000&filter[status]=dispatched&sort[created]=desc&limit=1&offset=0');
+    await probe('disputesEndpoint', '/disputes?site_id=2000&limit=2&offset=0');
+    await probe('casesEndpoint', '/cases?site_id=2000&limit=2&offset=0');
+    await probe('returnsEndpoint', '/returns?site_id=2000&limit=2&offset=0');
+    await probe('refundsEndpoint', '/refunds?site_id=2000&limit=2&offset=0');
+    if (orderId) {
+      await probe('singleOrder', `/orders/${encodeURIComponent(orderId)}?site_id=2000`);
+    }
+
+    res.json({ success: true, report });
+  }
+);
+
 // ============================================================================
 // INTENTIONALLY REMOVED (legacy — Firebase will offer to delete these, type Y):
 //   migrateAll, migrateOrders, migrateListings (v1, one-time, already ran)
