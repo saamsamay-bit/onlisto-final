@@ -28,6 +28,22 @@
  *     filter[status]=dispatched explicitly — this was the true root of the
  *     ghost-orders bug (dispatched on OnBuy, stuck 'active' on dashboard).
  *     Cancelled orders now flag needsAttention for human review.
+ * #11 SYNC EXTENSION (26 Jul 2026, probe-proven): sync also pulls
+ *     filter[status]=refunded (paginated) and mirrors OnBuy's raw refunds /
+ *     cancellation / dispatches objects onto order docs (onbuyRefunds,
+ *     onbuyCancellation, onbuyDispatches). Refunded orders flip status to
+ *     'Refunded' one-way (statusSource: onbuy_sync). Feeds the dashboard's
+ *     cancelled/refunded view + refund-rate KPI. NOTE: /disputes, /cases,
+ *     /returns, /refunds endpoints do NOT exist for sellers (HTTP 403,
+ *     probe-proven) — disputes stay on the email parser.
+ * #12 getLiveData heartbeat now includes the Refunded count + hasBuyerPhone.
+ * #13 BUYER PHONE (28 Jul 2026): the 23 Jul rebuild guessed
+ *     delivery_address.phone — wrong/empty, WhatsApp+call buttons vanished
+ *     from the orders table (they only render when buyerPhone exists).
+ *     extractBuyerPhone() tries every candidate field in buyer AND
+ *     delivery_address; import + both sync passes backfill buyerPhone when
+ *     empty. probeOnBuyData singleOrder now dumps buyer/delivery_address
+ *     inner KEY NAMES + phone-ish field paths (names only, never values).
  *
  * STILL TO VERIFY WITH ONE REAL CALL (testOnBuyAuth does this):
  *  - Which OnBuy auth style the live API actually accepts
@@ -156,6 +172,22 @@ function orderDocId(onbuyOrderId) {
   return `onbuy_${String(onbuyOrderId).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
 
+// Buyer phone (#13, 28 Jul 2026): the 23 Jul rebuild guessed
+// delivery_address.phone — real field name unconfirmed, so check EVERY
+// candidate in BOTH buyer and delivery_address. WhatsApp/call buttons on
+// the dashboard only render when buyerPhone exists — empty field = buttons
+// vanish (user-reported).
+function extractBuyerPhone(o) {
+  const addr = o.delivery_address || {};
+  const buyer = o.buyer || {};
+  const cand = [addr.phone, addr.phone_number, addr.telephone, addr.mobile, addr.contact_number,
+                buyer.phone, buyer.phone_number, buyer.telephone, buyer.mobile, buyer.contact_number];
+  for (const c of cand) {
+    if (c && String(c).replace(/\D/g, '').length >= 7) return String(c).trim();
+  }
+  return '';
+}
+
 // ---------------------------------------------------------------------------
 // ORDERS — one shared import/sync path (scheduler + manual use the same code)
 // ---------------------------------------------------------------------------
@@ -181,6 +213,8 @@ async function importOrSyncOrder(account, o) {
     if ((ex.onbuyStatus || '') !== onbuyStatus) updates.onbuyStatus = onbuyStatus;
     if (!ex.account) { updates.account = account.name; updates.team = account.team; }
     if (!ex.orgId) updates.orgId = ORG_ID;
+    const ph = extractBuyerPhone(o);
+    if (ph && !ex.buyerPhone) updates.buyerPhone = ph; // #13 backfill
     // Flag cancellations/refunds for a human instead of silently changing data
     const s = onbuyStatus.toLowerCase();
     if ((s.includes('cancel') || s.includes('refund')) && ex.status !== 'Cancelled') {
@@ -221,7 +255,7 @@ async function importOrSyncOrder(account, o) {
     sourceLink: '',
     notes: '',
     buyerName: addr.name || (o.buyer && o.buyer.name) || '',
-    buyerPhone: addr.phone || '',
+    buyerPhone: extractBuyerPhone(o),
     buyerEmail: (o.buyer && o.buyer.email) || '',
     buyerAddress: [addr.line_1, addr.town].filter(Boolean).join(', '),
     buyerPostcode: addr.postcode || '',
@@ -274,6 +308,8 @@ async function syncStatusFromOnBuy(account, o) {
 
   const updates = { lastSyncedAt: now };
   if ((ex.onbuyStatus || '') !== onbuyStatus) updates.onbuyStatus = onbuyStatus;
+  const ph = extractBuyerPhone(o);
+  if (ph && !ex.buyerPhone) updates.buyerPhone = ph; // #13 backfill
 
   // Sync extension (26 Jul 2026, pipeline #9/#11 data feed — probe-proven
   // fields): mirror OnBuy's raw money/workflow objects so the dashboard's
@@ -826,6 +862,7 @@ exports.getLiveData = onRequest({ cors: true, timeoutSeconds: 120 }, async (req,
         id: d.id, orderNo: o.orderNo, account: o.account, status: o.status,
         onbuyStatus: o.onbuyStatus || null, sellingPrice: o.sellingPrice,
         onbuyFee: o.onbuyFee, amount: o.amount, dispatchedToOnbuy: !!o.dispatchedToOnbuy,
+        hasBuyerPhone: !!o.buyerPhone,
         createdAt: o.createdAt && o.createdAt.toDate ? o.createdAt.toDate().toISOString() : null,
       };
     });
@@ -837,6 +874,7 @@ exports.getLiveData = onRequest({ cors: true, timeoutSeconds: 120 }, async (req,
         total: await countOf('orderTracker_orders'),
         active: await countOf('orderTracker_orders', 'status', 'active'),
         dispatched: await countOf('orderTracker_orders', 'status', 'Dispatched'),
+        refunded: await countOf('orderTracker_orders', 'status', 'Refunded'),
         pushedToOnBuy: await countOf('orderTracker_orders', 'dispatchedToOnbuy', true),
         needsAttention: await countOf('orderTracker_orders', 'needsAttention', true),
       },
@@ -1318,6 +1356,12 @@ exports.scheduledCheckSourcePrices = onSchedule(
 // order contain (all fields)? what do cancelled/dispatched orders carry?
 //   /probeOnBuyData?key=...&account=samayy&orderId=T6MD55X
 // Read-only. Returns field names + tiny samples — never secrets, never PII.
+// RESULT (26 Jul 2026): /disputes /cases /returns /refunds = HTTP 403 (do NOT
+// exist for sellers — disputes stay on the email parser). filter[status]=
+// refunded + cancelled both WORK; orders carry refunds/cancellation/
+// dispatches objects (now mirrored by the sync extension, fix #11).
+// #13 (28 Jul 2026): singleOrder also dumps buyer/delivery_address inner KEY
+// NAMES + phone-ish field paths — names only, never values.
 // ---------------------------------------------------------------------------
 exports.probeOnBuyData = onRequest(
   { secrets: ALL_SECRETS, timeoutSeconds: 120 },
@@ -1346,6 +1390,19 @@ exports.probeOnBuyData = onRequest(
         // For single-order probe: dump the whole order minus buyer PII
         if (name === 'singleOrder' && r.ok) {
           const o = j.order || (Array.isArray(list) && list[0]) || j;
+          // #13: key NAMES only — which field really holds the phone?
+          report.probes[name].buyerKeys = o.buyer ? Object.keys(o.buyer) : [];
+          report.probes[name].deliveryAddressKeys = o.delivery_address ? Object.keys(o.delivery_address) : [];
+          const phonePaths = [];
+          const walk = (obj, path) => {
+            if (!obj || typeof obj !== 'object') return;
+            for (const [k, v] of Object.entries(obj)) {
+              if (/phone|tel|mobile|contact/i.test(k)) phonePaths.push(`${path}${k}=${v ? '[has value]' : '[EMPTY]'}`);
+              if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, path + k + '.');
+            }
+          };
+          walk(o, '');
+          report.probes[name].phoneFieldsFound = phonePaths;
           const clean = {};
           for (const [k, v] of Object.entries(o)) {
             if (/name|address|phone|email|postcode|delivery/i.test(k)) { clean[k] = '[PII stripped]'; continue; }
