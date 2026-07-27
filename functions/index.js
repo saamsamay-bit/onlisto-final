@@ -28,14 +28,6 @@
  *     filter[status]=dispatched explicitly — this was the true root of the
  *     ghost-orders bug (dispatched on OnBuy, stuck 'active' on dashboard).
  *     Cancelled orders now flag needsAttention for human review.
- * #11 SYNC EXTENSION (26 Jul 2026, probe-proven): sync also pulls
- *     filter[status]=refunded (paginated) and mirrors OnBuy's raw refunds /
- *     cancellation / dispatches objects onto order docs (onbuyRefunds,
- *     onbuyCancellation, onbuyDispatches). Refunded orders flip status to
- *     'Refunded' one-way (statusSource: onbuy_sync). Feeds the dashboard's
- *     cancelled/refunded view + refund-rate KPI. NOTE: /disputes, /cases,
- *     /returns, /refunds endpoints do NOT exist for sellers (HTTP 403,
- *     probe-proven) — disputes stay on the email parser.
  *
  * STILL TO VERIFY WITH ONE REAL CALL (testOnBuyAuth does this):
  *  - Which OnBuy auth style the live API actually accepts
@@ -845,7 +837,6 @@ exports.getLiveData = onRequest({ cors: true, timeoutSeconds: 120 }, async (req,
         total: await countOf('orderTracker_orders'),
         active: await countOf('orderTracker_orders', 'status', 'active'),
         dispatched: await countOf('orderTracker_orders', 'status', 'Dispatched'),
-        refunded: await countOf('orderTracker_orders', 'status', 'Refunded'),
         pushedToOnBuy: await countOf('orderTracker_orders', 'dispatchedToOnbuy', true),
         needsAttention: await countOf('orderTracker_orders', 'needsAttention', true),
       },
@@ -1327,10 +1318,6 @@ exports.scheduledCheckSourcePrices = onSchedule(
 // order contain (all fields)? what do cancelled/dispatched orders carry?
 //   /probeOnBuyData?key=...&account=samayy&orderId=T6MD55X
 // Read-only. Returns field names + tiny samples — never secrets, never PII.
-// RESULT (26 Jul 2026): /disputes /cases /returns /refunds = HTTP 403 (do NOT
-// exist for sellers — disputes stay on the email parser). filter[status]=
-// refunded + cancelled both WORK; orders carry refunds/cancellation/
-// dispatches objects (now mirrored by the sync extension, fix #11).
 // ---------------------------------------------------------------------------
 exports.probeOnBuyData = onRequest(
   { secrets: ALL_SECRETS, timeoutSeconds: 120 },

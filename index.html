@@ -739,6 +739,18 @@
 
         <!-- KPI cards (Admin only) -->
         <div id="pnlSection">
+            <!-- Date range filter (#7) — applies to every KPI card below -->
+            <div id="dateRangeBar" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+                <span class="small" style="font-weight:800;color:var(--muted)">📅 Range:</span>
+                <input type="date" id="dateFrom" class="inp" style="width:auto;padding:6px 10px">
+                <span class="small muted">to</span>
+                <input type="date" id="dateTo" class="inp" style="width:auto;padding:6px 10px">
+                <button class="btn btn-primary btn-sm" onclick="applyDateRange()">Apply</button>
+                <button class="btn btn-ghost btn-sm" onclick="presetRange('today')">Today</button>
+                <button class="btn btn-ghost btn-sm" onclick="presetRange('7d')">7 days</button>
+                <button class="btn btn-ghost btn-sm" onclick="presetRange('30d')">30 days</button>
+                <button class="btn btn-ghost btn-sm" onclick="presetRange('all')">All time</button>
+            </div>
             <div class="pnl-grid">
                 <div class="kpi anim-fadeUp d1">
                     <div class="kpi-ic" style="--c1:#2563eb;--c2:#0ea5e9">
@@ -769,6 +781,12 @@
                         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
                     </div>
                     <div><p>Total OnBuy Selling Fees</p><h3 id="totalOnBuyFees">£0.00</h3></div>
+                </div>
+                <div class="kpi anim-fadeUp d5">
+                    <div class="kpi-ic" style="--c1:#d97706;--c2:#fbbf24">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+                    </div>
+                    <div><p>Refund &amp; Cancel Rate</p><h3 id="refundRate">0%</h3></div>
                 </div>
             </div>
             <p class="pnl-note" id="pnlNote">Live server-side sums across ALL orders — not just the latest 50.</p>
@@ -809,6 +827,14 @@
                         <div class="sub">Real-time orders from Firebase · updates instantly · flagged brands block dispatch</div>
                     </div>
                     <span class="chip-pending" id="pendingChip">0 pending dispatch</span>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:center">
+                    <button class="btn btn-ghost btn-sm ord-view" id="ov_all" onclick="setOrderView('all')">All</button>
+                    <button class="btn btn-ghost btn-sm ord-view" id="ov_pending" onclick="setOrderView('pending')">Pending</button>
+                    <button class="btn btn-ghost btn-sm ord-view" id="ov_dispatched" onclick="setOrderView('dispatched')">Dispatched</button>
+                    <button class="btn btn-ghost btn-sm ord-view" id="ov_cancelled" onclick="setOrderView('cancelled')">Cancelled</button>
+                    <button class="btn btn-ghost btn-sm ord-view" id="ov_refunded" onclick="setOrderView('refunded')">Refunded</button>
+                    <span id="orderPager" style="margin-left:auto" class="small muted"></span>
                 </div>
                 <div class="table-wrap">
                     <table>
@@ -1594,23 +1620,82 @@
             return allOrders;
         }
 
+        /* ================= DATE RANGE FILTER (#7) ================= */
+        window._dateFrom = null; window._dateTo = null;
+        window.applyDateRange = function() {
+            const f = $('dateFrom').value, t = $('dateTo').value;
+            window._dateFrom = f ? Timestamp.fromDate(new Date(f + 'T00:00:00')) : null;
+            window._dateTo = t ? Timestamp.fromDate(new Date(t + 'T23:59:59')) : null;
+            renderOrders(); calculatePNL();
+            toast('Date range applied to KPI cards.', 'success');
+        };
+        window.presetRange = function(p) {
+            const today = new Date(); const iso = d => d.toISOString().slice(0, 10);
+            if (p === 'all') { $('dateFrom').value = ''; $('dateTo').value = ''; }
+            else if (p === 'today') { $('dateFrom').value = iso(today); $('dateTo').value = iso(today); }
+            else if (p === '7d') { const d = new Date(); d.setDate(d.getDate() - 7); $('dateFrom').value = iso(d); $('dateTo').value = iso(today); }
+            else if (p === '30d') { const d = new Date(); d.setDate(d.getDate() - 30); $('dateFrom').value = iso(d); $('dateTo').value = iso(today); }
+            applyDateRange();
+        };
+        const inDateRange = o => {
+            if (!window._dateFrom && !window._dateTo) return true;
+            const d = o.createdAt && o.createdAt.toDate ? o.createdAt.toDate() : null;
+            if (!d) return true;
+            if (window._dateFrom && d < window._dateFrom.toDate()) return false;
+            if (window._dateTo && d > window._dateTo.toDate()) return false;
+            return true;
+        };
+
+        /* ================= ORDER STATES + VIEW FILTER + PAGINATION (#8/#9) ================= */
+        const orderState = o => {
+            const s = String(o.status || '');
+            const ob = (o.onbuyStatus || '').toLowerCase();
+            if (s === 'Cancelled' || !!o.onbuyCancellation || ob.includes('cancel')) return 'cancelled';
+            if (s === 'Refunded' || !!o.onbuyRefunds || ob.includes('refund')) return 'refunded';
+            if (s === 'Dispatched' || o.dispatchedToOnbuy === true) return 'dispatched';
+            return 'pending';
+        };
+        window._orderView = window._orderView || 'all';
+        window._orderPage = window._orderPage || 1;
+        window.setOrderView = function(v) { window._orderView = v; window._orderPage = 1; renderOrders(); };
+
         window.renderOrders = function() {
             const tbody = $('ordersTableBody');
-            const filtered = getVisibleOrders();
+            const stateFiltered = getVisibleOrders().filter(o => inDateRange(o) &&
+                (window._orderView === 'all' ? true : orderState(o) === window._orderView));
+            const PAGE = 50;
+            const pages = Math.max(1, Math.ceil(stateFiltered.length / PAGE));
+            if (window._orderPage > pages) window._orderPage = pages;
+            const filtered = stateFiltered.slice((window._orderPage - 1) * PAGE, window._orderPage * PAGE);
+            document.querySelectorAll('.ord-view').forEach(b => b.classList.remove('btn-primary'));
+            const activeViewBtn = $('ov_' + window._orderView);
+            if (activeViewBtn) activeViewBtn.classList.add('btn-primary');
 
             let pending = 0;
             const rows = filtered.map(o => {
                 const isPan = o.team === 'panacea';
                 const badge = isPan ? 'badge-panacea' : 'badge-samayy';
-                const dispatched = o.status === 'Dispatched' || o.dispatchedToOnbuy === true;
-                if (!dispatched) pending++;
+                const oState = orderState(o);
+                const dispatched = oState === 'dispatched';
+                if (oState === 'pending') pending++;
 
                 // --- banned-brand check (auto-learned list) ---
                 const bannedHit = matchBanned((o.item || '') + ' ' + (o.title || '') + ' ' + (o.sku || ''));
                 const flagged = !!bannedHit && o.flagIgnored !== true;
 
                 let statusHtml;
-                if (dispatched) {
+                if (oState === 'cancelled') {
+                    const cx = o.onbuyCancellation || {};
+                    statusHtml = `<span class="badge badge-danger">Cancelled</span><br>
+                       <span class="small muted">${esc(cx.reason || cx.type || o.attentionReason || 'Cancelled on OnBuy')}</span><br>
+                       <span class="small muted">${o.refundAt || o.cancelledAt ? fmtTs(o.cancelledAt || o.refundAt) : ''}</span>`;
+                } else if (oState === 'refunded') {
+                    const rfArr = Array.isArray(o.onbuyRefunds) ? o.onbuyRefunds : [];
+                    const rfTotal = rfArr.reduce((t, r) => t + (Number(r.amount ?? r.total ?? r.price) || 0), 0) || Number(o.refundAmount) || 0;
+                    statusHtml = `<span class="badge" style="background:#fff7ed;color:#c2410c;border:1px solid #fdba74">Refunded</span><br>
+                       ${rfTotal ? `<span class="small" style="color:#c2410c;font-weight:800">−${fmt(rfTotal)}</span><br>` : ''}
+                       <span class="small muted">${o.refundAt ? fmtTs(o.refundAt) : ''}</span>`;
+                } else if (dispatched) {
                     statusHtml = `<span class="badge badge-success">Dispatched</span><br>
                        <span class="small" style="font-weight:800;color:var(--ink)">${esc(o.trackingCarrier || '')}</span><br>
                        <span class="small muted mono">${esc(o.trackingNumber || '')}</span>`;
@@ -1681,6 +1766,15 @@
             tbody.innerHTML = rows.length ? rows.join('')
                 : `<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted)">No orders in this view yet.</td></tr>`;
             $('pendingChip').textContent = `${pending} pending dispatch`;
+            const pager = $('orderPager');
+            if (pager) {
+                pager.innerHTML = pages > 1
+                    ? `<button class="btn btn-ghost btn-sm" ${window._orderPage <= 1 ? 'disabled' : ''} onclick="window._orderPage--;renderOrders()">‹ Prev</button>
+                       <b> Page ${window._orderPage} of ${pages} </b>
+                       <button class="btn btn-ghost btn-sm" ${window._orderPage >= pages ? 'disabled' : ''} onclick="window._orderPage++;renderOrders()">Next ›</button>
+                       <span class="muted">(${stateFiltered.length} orders · 50/page)</span>`
+                    : `<span class="muted">${stateFiltered.length} orders</span>`;
+            }
         };
 
         /* ================= P&L — REAL SERVER-SIDE SUMS ACROSS ALL ORDERS ================= */
@@ -1770,7 +1864,16 @@
             if (currentRole !== 'admin') return;
             const f = $('accountFilterDropdown').value;
             const wh = f !== 'All Accounts' ? [where('team', '==', f.toLowerCase())] : [];
+            const dwh = [];
+            if (window._dateFrom) dwh.push(where('createdAt', '>=', window._dateFrom));
+            if (window._dateTo) dwh.push(where('createdAt', '<=', window._dateTo));
+            wh.push(...dwh);
             let notes = [];
+            if (window._dateFrom || window._dateTo) {
+                const fd = window._dateFrom ? window._dateFrom.toDate().toLocaleDateString('en-GB') : '…';
+                const td = window._dateTo ? window._dateTo.toDate().toLocaleDateString('en-GB') : '…';
+                notes.push(`📅 Filtered: ${fd} → ${td}.`);
+            }
             const pct = Number(bizSettings.sourcingPct) || 0;
             const expAll = expensesAllTime();
             // --- totals ---
@@ -1785,7 +1888,7 @@
             } catch (e) {
                 console.error('P&L totals aggregation error:', e);
                 let s = 0, p = 0, c = 0, f = 0;
-                getVisibleOrders().forEach(o => { const sale = Number(o.sellingPrice) || 0; const cost = Number(o.amount) || 0; const fee = Number(o.onbuyFee) || 0; s += sale; c += cost; f += fee; p += sale - fee - cost; });
+                getVisibleOrders().filter(inDateRange).forEach(o => { const sale = Number(o.sellingPrice) || 0; const cost = Number(o.amount) || 0; const fee = Number(o.onbuyFee) || 0; s += sale; c += cost; f += fee; p += sale - fee - cost; });
                 animateValue($('totalSales'), s);
                 animateValue($('netProfit'), p - (c * pct / 100) - expAll);
                 animateValue($('totalOnBuyFees'), f);
@@ -1796,13 +1899,13 @@
             // --- VA splits ---
             if (f === 'All Accounts') {
                 try {
-                    const [pd, sd] = await Promise.all([trySum([where('account', '==', 'Panacea')]), trySum([where('account', '==', 'Samayy')])]);
+                    const [pd, sd] = await Promise.all([trySum([where('account', '==', 'Panacea'), ...dwh]), trySum([where('account', '==', 'Samayy'), ...dwh])]);
                     animateValue($('panaceaSplit'), profitOf(pd) * 0.30);
                     animateValue($('samayySplit'), profitOf(sd) * 0.20);
                 } catch (e) {
                     console.error('P&L splits aggregation error:', e);
                     let pan = 0, sam = 0;
-                    allOrders.forEach(o => {
+                    allOrders.filter(inDateRange).forEach(o => {
                         const p = (Number(o.sellingPrice) || 0) - (Number(o.onbuyFee) || 0) - (Number(o.amount) || 0);
                         if (o.team === 'panacea') pan += p;
                         if (o.team === 'samayy') sam += p;
@@ -1816,6 +1919,19 @@
                 $('panaceaSplit').textContent = '—';
                 $('samayySplit').textContent = '—';
                 notes.push('Switch to All Accounts for VA splits.');
+            }
+            // --- refund & cancel rate (#11) — same scope (account + date) as totals ---
+            try {
+                const totAgg = await getAggregateFromServer(query(collection(db, "orderTracker_orders"), ...wh), { n: count() });
+                const refAgg = await getAggregateFromServer(query(collection(db, "orderTracker_orders"), ...wh, where('status', '==', 'Refunded')), { n: count() });
+                const canAgg = await getAggregateFromServer(query(collection(db, "orderTracker_orders"), ...wh, where('status', '==', 'Cancelled')), { n: count() });
+                const tot = totAgg.data().n || 0;
+                const rate = tot ? ((refAgg.data().n + canAgg.data().n) / tot * 100) : 0;
+                $('refundRate').textContent = rate.toFixed(1) + '%';
+            } catch (e) {
+                const vis = getVisibleOrders().filter(inDateRange);
+                const rc = vis.filter(o => orderState(o) === 'refunded' || orderState(o) === 'cancelled').length;
+                $('refundRate').textContent = (vis.length ? rc / vis.length * 100 : 0).toFixed(1) + '%';
             }
             $('pnlNote').innerHTML = notes.join(' ');
         }
