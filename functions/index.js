@@ -28,6 +28,14 @@
  *     filter[status]=dispatched explicitly — this was the true root of the
  *     ghost-orders bug (dispatched on OnBuy, stuck 'active' on dashboard).
  *     Cancelled orders now flag needsAttention for human review.
+ * #11 SYNC EXTENSION (26 Jul 2026, probe-proven): sync also pulls
+ *     filter[status]=refunded (paginated) and mirrors OnBuy's raw refunds /
+ *     cancellation / dispatches objects onto order docs (onbuyRefunds,
+ *     onbuyCancellation, onbuyDispatches). Refunded orders flip status to
+ *     'Refunded' one-way (statusSource: onbuy_sync). Feeds the dashboard's
+ *     cancelled/refunded view + refund-rate KPI. NOTE: /disputes, /cases,
+ *     /returns, /refunds endpoints do NOT exist for sellers (HTTP 403,
+ *     probe-proven) — disputes stay on the email parser.
  *
  * STILL TO VERIFY WITH ONE REAL CALL (testOnBuyAuth does this):
  *  - Which OnBuy auth style the live API actually accepts
@@ -275,11 +283,29 @@ async function syncStatusFromOnBuy(account, o) {
   const updates = { lastSyncedAt: now };
   if ((ex.onbuyStatus || '') !== onbuyStatus) updates.onbuyStatus = onbuyStatus;
 
+  // Sync extension (26 Jul 2026, pipeline #9/#11 data feed — probe-proven
+  // fields): mirror OnBuy's raw money/workflow objects so the dashboard's
+  // cancelled/refunded view + refund-rate KPI can read them from Firestore.
+  const rawMirror = [['refunds', 'onbuyRefunds'], ['cancellation', 'onbuyCancellation'], ['dispatches', 'onbuyDispatches']];
+  for (const [srcField, dstField] of rawMirror) {
+    if (o[srcField] !== undefined) {
+      const incoming = JSON.stringify(o[srcField] || null);
+      if (incoming !== JSON.stringify(ex[dstField] || null)) updates[dstField] = o[srcField] || null;
+    }
+  }
+
   const currentStatus = String(ex.status || '');
   // Cancelled on OnBuy → flag for a human, never auto-change status.
   if (s.includes('cancel') && currentStatus !== 'Cancelled' && !ex.needsAttention) {
     updates.needsAttention = true;
     updates.attentionReason = `OnBuy shows: ${onbuyStatus}`;
+  }
+
+  // Refunded on OnBuy → dashboard follows (one-way, same rule as dispatch).
+  if (s.includes('refund') && currentStatus !== 'Refunded' && currentStatus !== 'Cancelled') {
+    updates.status = 'Refunded';
+    updates.statusSource = 'onbuy_sync';
+    if (!ex.refundAt) updates.refundAt = now;
   }
 
   const alreadyHandled = currentStatus.toLowerCase() === 'dispatched' || currentStatus === 'Cancelled';
@@ -292,6 +318,7 @@ async function syncStatusFromOnBuy(account, o) {
   if (Object.keys(updates).length > 1) {
     await ref.update(updates);
     if (updates.status === 'Dispatched') return 'dispatched';
+    if (updates.status === 'Refunded') return 'refunded';
     if (updates.needsAttention) return 'attention';
     return 'synced';
   }
@@ -358,6 +385,20 @@ async function pullOrdersForAccount(account, fullRescan) {
     for (const o of extractList(cancelled, `cancelled orders (${account.name})`)) {
       const r = await syncStatusFromOnBuy(account, o);
       if (r === 'attention') counts.cancelFlagged = (counts.cancelFlagged || 0) + 1;
+    }
+
+    // Refunded orders (26 Jul 2026 — probe-proven filter): dashboard follows
+    // one-way, refunds object mirrored by syncStatusFromOnBuy. Paginated.
+    for (let offset = 0; offset < 300; offset += 100) {
+      const refunded = await onbuyGet(token,
+        `/orders?site_id=2000&filter[status]=refunded&sort[created]=desc&limit=100&offset=${offset}`);
+      const list = extractList(refunded, `refunded orders offset ${offset} (${account.name})`);
+      if (!list.length) break;
+      for (const o of list) {
+        const r = await syncStatusFromOnBuy(account, o);
+        if (r === 'refunded') counts.refundedSynced = (counts.refundedSynced || 0) + 1;
+      }
+      if (list.length < 100) break;
     }
   } catch (e) {
     logger.error(`recent-orders sync failed (${account.name}): ${e.message}`);
@@ -804,6 +845,7 @@ exports.getLiveData = onRequest({ cors: true, timeoutSeconds: 120 }, async (req,
         total: await countOf('orderTracker_orders'),
         active: await countOf('orderTracker_orders', 'status', 'active'),
         dispatched: await countOf('orderTracker_orders', 'status', 'Dispatched'),
+        refunded: await countOf('orderTracker_orders', 'status', 'Refunded'),
         pushedToOnBuy: await countOf('orderTracker_orders', 'dispatchedToOnbuy', true),
         needsAttention: await countOf('orderTracker_orders', 'needsAttention', true),
       },
@@ -1285,6 +1327,10 @@ exports.scheduledCheckSourcePrices = onSchedule(
 // order contain (all fields)? what do cancelled/dispatched orders carry?
 //   /probeOnBuyData?key=...&account=samayy&orderId=T6MD55X
 // Read-only. Returns field names + tiny samples — never secrets, never PII.
+// RESULT (26 Jul 2026): /disputes /cases /returns /refunds = HTTP 403 (do NOT
+// exist for sellers — disputes stay on the email parser). filter[status]=
+// refunded + cancelled both WORK; orders carry refunds/cancellation/
+// dispatches objects (now mirrored by the sync extension, fix #11).
 // ---------------------------------------------------------------------------
 exports.probeOnBuyData = onRequest(
   { secrets: ALL_SECRETS, timeoutSeconds: 120 },
