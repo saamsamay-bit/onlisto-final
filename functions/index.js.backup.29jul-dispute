@@ -28,22 +28,6 @@
  *     filter[status]=dispatched explicitly — this was the true root of the
  *     ghost-orders bug (dispatched on OnBuy, stuck 'active' on dashboard).
  *     Cancelled orders now flag needsAttention for human review.
- * #11 SYNC EXTENSION (26 Jul 2026, probe-proven): sync also pulls
- *     filter[status]=refunded (paginated) and mirrors OnBuy's raw refunds /
- *     cancellation / dispatches objects onto order docs (onbuyRefunds,
- *     onbuyCancellation, onbuyDispatches). Refunded orders flip status to
- *     'Refunded' one-way (statusSource: onbuy_sync). Feeds the dashboard's
- *     cancelled/refunded view + refund-rate KPI. NOTE: /disputes, /cases,
- *     /returns, /refunds endpoints do NOT exist for sellers (HTTP 403,
- *     probe-proven) — disputes stay on the email parser.
- * #12 getLiveData heartbeat now includes the Refunded count + hasBuyerPhone.
- * #13 BUYER PHONE (28 Jul 2026): the 23 Jul rebuild guessed
- *     delivery_address.phone — wrong/empty, WhatsApp+call buttons vanished
- *     from the orders table (they only render when buyerPhone exists).
- *     extractBuyerPhone() tries every candidate field in buyer AND
- *     delivery_address; import + both sync passes backfill buyerPhone when
- *     empty. probeOnBuyData singleOrder now dumps buyer/delivery_address
- *     inner KEY NAMES + phone-ish field paths (names only, never values).
  *
  * STILL TO VERIFY WITH ONE REAL CALL (testOnBuyAuth does this):
  *  - Which OnBuy auth style the live API actually accepts
@@ -60,10 +44,6 @@ const logger = require('firebase-functions/logger');
 const admin = require('firebase-admin');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const Imap = require('imap');
-const { simpleParser } = require('mailparser');
-const nodemailer = require('nodemailer');
-
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -176,20 +156,153 @@ function orderDocId(onbuyOrderId) {
   return `onbuy_${String(onbuyOrderId).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
 
-// Buyer phone (#13, 28 Jul 2026): the 23 Jul rebuild guessed
-// delivery_address.phone — real field name unconfirmed, so check EVERY
-// candidate in BOTH buyer and delivery_address. WhatsApp/call buttons on
-// the dashboard only render when buyerPhone exists — empty field = buttons
-// vanish (user-reported).
-function extractBuyerPhone(o) {
-  const addr = o.delivery_address || {};
-  const buyer = o.buyer || {};
-  const cand = [addr.phone, addr.phone_number, addr.telephone, addr.mobile, addr.contact_number,
-                buyer.phone, buyer.phone_number, buyer.telephone, buyer.mobile, buyer.contact_number];
-  for (const c of cand) {
-    if (c && String(c).replace(/\D/g, '').length >= 7) return String(c).trim();
+// ---------------------------------------------------------------------------
+// DISPUTE EMAIL PARSER (#14, 29 Jul 2026)
+// Built against REAL OnBuy dispute emails (29 Jul 2026 samples).
+// Patterns proven from live emails: order T6K27YN/T6KQVBS/T6KMBBR/T6KPKG8,
+// dispute refs 1216954/1211804/1216370, subjects "We need your help!" /
+// "OnBuy Customer Escalation" / "RE: OnBuy order number...Dispute reference".
+// ---------------------------------------------------------------------------
+function parseDisputeEmail(text, html, subject, from) {
+  const body = (text || html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+  const combined = `${subject} ${body}`.toLowerCase();
+  const subjectUpper = (subject || '').toUpperCase();
+  const bodyUpper = body.toUpperCase();
+
+  // ── ORDER ID (OnBuy format: T6K27YN, T6KQVBS, T6KMBBR, T6KPKG8) ──
+  // Pattern: "order number: T6K27YN" or "ORDER NO. T6KQVBS" or "Escalation - T6KMBBR"
+  let orderId = null;
+  const orderPatterns = [
+    /order\s*number[:\s]+([A-Z0-9]{6,10})/i,
+    /order\s*no\.?[:\s]+([A-Z0-9]{6,10})/i,
+    /escalation\s*[-–]\s*([A-Z0-9]{6,10})/i,
+    /order\s+([A-Z0-9]{6,10})\s*\./i,
+    /request\s*\(\d+\).*?order\s*[:\s]+([A-Z0-9]{6,10})/i,
+    /#\s*([A-Z0-9]{6,10})/i,
+  ];
+  for (const p of orderPatterns) {
+    const m = body.match(p) || subject.match(p);
+    if (m && m[1]) { orderId = m[1].trim().toUpperCase(); break; }
   }
-  return '';
+  // Fallback: any standalone T-prefixed 6-7 char code in body
+  if (!orderId) {
+    const fallback = bodyUpper.match(/\b(T[A-Z0-9]{5,7})\b/);
+    if (fallback) orderId = fallback[1];
+  }
+
+  // ── DISPUTE / CASE / REQUEST REFERENCE ──
+  // "Your request (1216954) has been updated" or "Dispute reference 1211804"
+  let disputeRef = null;
+  const refPatterns = [
+    /request\s*\(\s*(\d{5,10})\s*\)/i,
+    /dispute\s+reference\s*[:\s]+(\d{5,10})/i,
+    /case\s+reference\s*[:\s]+(\d{5,10})/i,
+    /claim\s+reference\s*[:\s]+(\d{5,10})/i,
+    /reference\s*[:\s]+(\d{5,10})/i,
+    /ref[\s.]*[:\s]+(\d{5,10})/i,
+  ];
+  for (const p of refPatterns) {
+    const m = body.match(p) || subject.match(p);
+    if (m && m[1]) { disputeRef = m[1].trim(); break; }
+  }
+
+  // ── REASON EXTRACTION (OnBuy-specific language) ──
+  let reason = null;
+  const reasonPatterns = [
+    /raised\s+a\s+chargeback.*?because\s+([^\n.]{10,300})/i,
+    /raised\s+a\s+chargeback.*?as\s+they\s+haven'?t\s+received\s+([^\n.]{5,200})/i,
+    /buyer\s+had\s+messaged\s+you\s+because\s+([^\n.]{10,300})/i,
+    /they\s+had\s+not\s+received\s+([^\n.]{5,200})/i,
+    /haven'?t\s+received\s+([^\n.]{5,200})/i,
+    /not\s+received\s+their\s+([^\n.]{5,200})/i,
+    /reason[:\s]+([^\n.]{5,200})/i,
+    /issue[:\s]+([^\n.]{5,200})/i,
+  ];
+  for (const p of reasonPatterns) {
+    const m = body.match(p);
+    if (m && m[1]) { reason = m[1].trim(); break; }
+  }
+
+  // Keyword fallback for OnBuy dispute types
+  if (!reason) {
+    if (combined.includes('chargeback')) reason = 'Chargeback - item not received';
+    else if (combined.includes('not received') || combined.includes("haven't received")) reason = 'Item not received';
+    else if (combined.includes('not as described')) reason = 'Item not as described';
+    else if (combined.includes('damaged')) reason = 'Item damaged';
+    else if (combined.includes('faulty')) reason = 'Item faulty';
+    else if (combined.includes('wrong item')) reason = 'Wrong item sent';
+    else if (combined.includes('missing')) reason = 'Missing parts';
+  }
+  // Clean up weak captures
+  if (reason && (reason.match(/^their\s+item/i) || reason.match(/^the\s+item/i))) {
+    reason = "Item not received";
+  }
+
+  // ── DEADLINE EXTRACTION ──
+  let deadline = null;
+  const deadlinePatterns = [
+    /respond\s+(?:by|before|within)\s*[:\s]+([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})/i,
+    /respond\s+to\s+any\s+future\s+customer\s+messages\s+within\s+([0-9]+)\s+working\s+days/i,
+    /deadline\s*[:\s]+([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})/i,
+    /by\s+([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})/i,
+    /([0-9]{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+[0-9]{4})/i,
+  ];
+  for (const p of deadlinePatterns) {
+    const m = body.match(p) || subject.match(p);
+    if (m && m[1]) { deadline = m[1].trim(); break; }
+  }
+
+  // ── FEE EXTRACTION ──
+  let feeAmount = null;
+  const feeMatch = body.match(/dispute\s*(?:handling\s*)?fee\s+of\s+£?([0-9,.]+)/i)
+    || body.match(/debited\s+£?([0-9,.]+)\s+from\s+your\s+account/i)
+    || body.match(/additional\s+charge\s+of\s+£?([0-9,.]+)/i);
+  if (feeMatch && feeMatch[1]) {
+    feeAmount = parseFloat(feeMatch[1].replace(/,/g, ''));
+  }
+
+  // ── DISPUTE TYPE ──
+  let type = 'Other';
+  if (combined.includes('chargeback')) type = 'Chargeback';
+  else if (combined.includes('escalation')) type = 'Escalation';
+  else if (combined.includes('return')) type = 'Return';
+  else if (combined.includes('refund')) type = 'Refund';
+  else if (combined.includes('not received') || combined.includes("haven't received")) type = 'Not Received';
+  else if (combined.includes('not as described') || combined.includes('damaged') || combined.includes('faulty')) type = 'Not As Described';
+  else if (combined.includes('chargeback')) type = 'Chargeback';
+
+  // ── OUTCOME ──
+  let outcome = null;
+  if (body.match(/found\s+in\s+buyer\s+favour/i)) outcome = 'Lost - buyer favour';
+  else if (body.match(/found\s+in\s+seller\s+favour/i)) outcome = 'Won - seller favour';
+  else if (body.match(/we\s+have\s+reviewed\s+this\s+case/i)) outcome = 'Reviewed';
+
+  // ── URGENCY ──
+  let urgency = 'Normal';
+  if (type === 'Chargeback' || type === 'Escalation') urgency = 'High';
+  if (combined.includes('urgent') || combined.includes('immediate') || combined.includes('24 hour')) urgency = 'High';
+  if (deadline) {
+    try {
+      const d = new Date(deadline);
+      const daysUntil = (d - Date.now()) / 864e5;
+      if (daysUntil <= 2) urgency = 'High';
+      else if (daysUntil <= 5) urgency = 'Medium';
+    } catch (e) {}
+  }
+  // OnBuy "respond within 2 working days" = High
+  if (body.match(/respond\s+.*\s+within\s+2\s+working\s+days/i)) urgency = 'High';
+
+  return {
+    orderId,
+    disputeRef,
+    reason,
+    deadline,
+    type,
+    urgency,
+    outcome,
+    feeAmount,
+    confidence: (orderId && disputeRef) ? 'high' : (orderId || disputeRef) ? 'medium' : 'low',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -217,8 +330,6 @@ async function importOrSyncOrder(account, o) {
     if ((ex.onbuyStatus || '') !== onbuyStatus) updates.onbuyStatus = onbuyStatus;
     if (!ex.account) { updates.account = account.name; updates.team = account.team; }
     if (!ex.orgId) updates.orgId = ORG_ID;
-    const ph = extractBuyerPhone(o);
-    if (ph && !ex.buyerPhone) updates.buyerPhone = ph; // #13 backfill
     // Flag cancellations/refunds for a human instead of silently changing data
     const s = onbuyStatus.toLowerCase();
     if ((s.includes('cancel') || s.includes('refund')) && ex.status !== 'Cancelled') {
@@ -259,7 +370,7 @@ async function importOrSyncOrder(account, o) {
     sourceLink: '',
     notes: '',
     buyerName: addr.name || (o.buyer && o.buyer.name) || '',
-    buyerPhone: extractBuyerPhone(o),
+    buyerPhone: addr.phone || '',
     buyerEmail: (o.buyer && o.buyer.email) || '',
     buyerAddress: [addr.line_1, addr.town].filter(Boolean).join(', '),
     buyerPostcode: addr.postcode || '',
@@ -312,8 +423,6 @@ async function syncStatusFromOnBuy(account, o) {
 
   const updates = { lastSyncedAt: now };
   if ((ex.onbuyStatus || '') !== onbuyStatus) updates.onbuyStatus = onbuyStatus;
-  const ph = extractBuyerPhone(o);
-  if (ph && !ex.buyerPhone) updates.buyerPhone = ph; // #13 backfill
 
   // Sync extension (26 Jul 2026, pipeline #9/#11 data feed — probe-proven
   // fields): mirror OnBuy's raw money/workflow objects so the dashboard's
@@ -866,7 +975,6 @@ exports.getLiveData = onRequest({ cors: true, timeoutSeconds: 120 }, async (req,
         id: d.id, orderNo: o.orderNo, account: o.account, status: o.status,
         onbuyStatus: o.onbuyStatus || null, sellingPrice: o.sellingPrice,
         onbuyFee: o.onbuyFee, amount: o.amount, dispatchedToOnbuy: !!o.dispatchedToOnbuy,
-        hasBuyerPhone: !!o.buyerPhone,
         createdAt: o.createdAt && o.createdAt.toDate ? o.createdAt.toDate().toISOString() : null,
       };
     });
@@ -878,7 +986,6 @@ exports.getLiveData = onRequest({ cors: true, timeoutSeconds: 120 }, async (req,
         total: await countOf('orderTracker_orders'),
         active: await countOf('orderTracker_orders', 'status', 'active'),
         dispatched: await countOf('orderTracker_orders', 'status', 'Dispatched'),
-        refunded: await countOf('orderTracker_orders', 'status', 'Refunded'),
         pushedToOnBuy: await countOf('orderTracker_orders', 'dispatchedToOnbuy', true),
         needsAttention: await countOf('orderTracker_orders', 'needsAttention', true),
       },
@@ -1360,12 +1467,6 @@ exports.scheduledCheckSourcePrices = onSchedule(
 // order contain (all fields)? what do cancelled/dispatched orders carry?
 //   /probeOnBuyData?key=...&account=samayy&orderId=T6MD55X
 // Read-only. Returns field names + tiny samples — never secrets, never PII.
-// RESULT (26 Jul 2026): /disputes /cases /returns /refunds = HTTP 403 (do NOT
-// exist for sellers — disputes stay on the email parser). filter[status]=
-// refunded + cancelled both WORK; orders carry refunds/cancellation/
-// dispatches objects (now mirrored by the sync extension, fix #11).
-// #13 (28 Jul 2026): singleOrder also dumps buyer/delivery_address inner KEY
-// NAMES + phone-ish field paths — names only, never values.
 // ---------------------------------------------------------------------------
 exports.probeOnBuyData = onRequest(
   { secrets: ALL_SECRETS, timeoutSeconds: 120 },
@@ -1394,19 +1495,6 @@ exports.probeOnBuyData = onRequest(
         // For single-order probe: dump the whole order minus buyer PII
         if (name === 'singleOrder' && r.ok) {
           const o = j.order || (Array.isArray(list) && list[0]) || j;
-          // #13: key NAMES only — which field really holds the phone?
-          report.probes[name].buyerKeys = o.buyer ? Object.keys(o.buyer) : [];
-          report.probes[name].deliveryAddressKeys = o.delivery_address ? Object.keys(o.delivery_address) : [];
-          const phonePaths = [];
-          const walk = (obj, path) => {
-            if (!obj || typeof obj !== 'object') return;
-            for (const [k, v] of Object.entries(obj)) {
-              if (/phone|tel|mobile|contact/i.test(k)) phonePaths.push(`${path}${k}=${v ? '[has value]' : '[EMPTY]'}`);
-              if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, path + k + '.');
-            }
-          };
-          walk(o, '');
-          report.probes[name].phoneFieldsFound = phonePaths;
           const clean = {};
           for (const [k, v] of Object.entries(o)) {
             if (/name|address|phone|email|postcode|delivery/i.test(k)) { clean[k] = '[PII stripped]'; continue; }
@@ -1435,142 +1523,99 @@ exports.probeOnBuyData = onRequest(
   }
 );
 
-// ============================================================================
-// INTENTIONALLY REMOVED (legacy — Firebase will offer to delete these, type Y):
-//   migrateAll, migrateOrders, migrateListings (v1, one-time, already ran)
-//   migrateData (open collection copier — security risk)
-//   cleanupDuplicates (one-time, already ran 21 Jul)
-//   testScrapingBee (debug tool, no longer needed)
-//   getLiveDataV2 (reborn as the read-only getLiveData API above)
-//   sendSignupCode, verifySignupCode (signup flow not in use)
-//   pullOnBuyListingsHourly (replaced by paginated pullOnBuyListings above)
+// ---------------------------------------------------------------------------
+// DISPUTE EMAIL FUNCTIONS (#14, 29 Jul 2026)
+// ---------------------------------------------------------------------------
 
-// ============================================================================
-// DISPUTE EMAIL PARSER — receives forwarded OnBuy dispute emails
-// ============================================================================
-
-// Helper: parse OnBuy dispute email body into structured data
-function parseDisputeEmail(subject, text, html) {
-  const body = text || html || '';
-  const result = {
-    disputeRef: '',
-    orderId: '',
-    reason: '',
-    deadline: '',
-    status: 'Open',
-    receivedAt: new Date().toISOString(),
-    rawSubject: subject || '',
-    rawBody: body.slice(0, 5000),
-  };
-
-  // Extract dispute reference (e.g., T6K27YN, T6KQVBS)
-  const refMatch = subject.match(/([A-Z0-9]{6,8})/) || body.match(/Reference[:\s#]+([A-Z0-9]{6,8})/i);
-  if (refMatch) result.disputeRef = refMatch[1];
-
-  // Extract order ID (OnBuy order numbers like T6K27YN or numeric)
-  const orderMatch = body.match(/Order\s*#?\s*[:\s]+([A-Z0-9]{6,10})/i) ||
-                     body.match(/order[_\s]id[:\s]+([A-Z0-9]{6,10})/i) ||
-                     subject.match(/([A-Z0-9]{6,8})/);
-  if (orderMatch) result.orderId = orderMatch[1];
-
-  // Extract reason
-  const reasonPatterns = [
-    /Reason\s*[:\s]+(.+?)(?:
-|$)/i,
-    /dispute reason[:\s]+(.+?)(?:
-|$)/i,
-    /customer claims[:\s]+(.+?)(?:
-|$)/i,
-    /issue[:\s]+(.+?)(?:
-|$)/i,
-  ];
-  for (const p of reasonPatterns) {
-    const m = body.match(p);
-    if (m) { result.reason = m[1].trim(); break; }
-  }
-  if (!result.reason) {
-    // fallback: first sentence after "dispute" or "claim"
-    const fb = body.match(/dispute.{0,200}/i) || body.match(/claim.{0,200}/i);
-    if (fb) result.reason = fb[0].replace(/\s+/g, ' ').trim().slice(0, 200);
-  }
-
-  // Extract deadline
-  const deadlinePatterns = [
-    /respond by[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
-    /deadline[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
-    /by[:\s]+(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})/i,
-    /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}).{0,30}deadline/i,
-  ];
-  for (const p of deadlinePatterns) {
-    const m = body.match(p);
-    if (m) { result.deadline = m[1]; break; }
-  }
-
-  return result;
-}
-
-// HTTP endpoint: receive dispute email (SendGrid Inbound Parse or direct POST)
+// SendGrid Inbound Parse webhook — production entry point.
+// Also accepts JSON/URL-encoded for testing without SendGrid set up yet.
+// SendGrid sends multipart/form-data; we handle that with a simple parser.
 exports.receiveDisputeEmail = onRequest(
   { cors: true, timeoutSeconds: 60, memory: '256MiB' },
   async (req, res) => {
     try {
-      const { subject, text, html, from, to } = req.body || {};
-      const parsed = parseDisputeEmail(subject, text, html);
-
-      // Determine which client/account this belongs to
-      let team = '';
-      let account = '';
-      let clientEmail = '';
-      const fromStr = String(from || '').toLowerCase();
-      const toStr = String(to || '').toLowerCase();
-
-      if (toStr.includes('panacea') || toStr.includes('slidaro')) {
-        team = 'panacea'; account = 'Panacea'; clientEmail = 'slidaro@onlisto.io';
-      } else if (toStr.includes('samay') || toStr.includes('samayy')) {
-        team = 'samayy'; account = 'Samayy'; clientEmail = 'samay@onlisto.io';
-      } else {
-        // fallback: look up client by replyFromEmail in orderTracker_clients
-        team = 'unknown'; account = 'Unknown';
+      // If SendGrid sends multipart, req.body may be empty. Parse from raw.
+      let payload = req.body || {};
+      if (!payload.from && req.rawBody) {
+        const raw = req.rawBody.toString('utf8');
+        // Simple multipart parser: extract key="value" pairs
+        const fields = {};
+        const lines = raw.split(/\r?\n/);
+        let currentField = null;
+        for (const line of lines) {
+          if (line.match(/Content-Disposition: form-data; name="([^"]+)"/)) {
+            currentField = line.match(/name="([^"]+)"/)[1];
+          } else if (currentField && line.trim() && !line.startsWith('--') && !line.includes('Content-Type')) {
+            fields[currentField] = (fields[currentField] || '') + line;
+          }
+        }
+        payload = fields;
       }
 
-      // Look up order to link dispute
-      let orderDoc = null;
+      const from = payload.from || '';
+      const to = payload.to || '';
+      const subject = payload.subject || '';
+      const text = payload.text || '';
+      const html = payload.html || '';
+
+      if (!from || !subject) {
+        return res.status(400).json({ error: 'Missing from or subject. Expected SendGrid Inbound Parse payload.' });
+      }
+
+      const parsed = parseDisputeEmail(text, html, subject, from);
+      const now = admin.firestore.FieldValue.serverTimestamp();
+
+      // Try to link to existing order
+      let linkedOrderId = null;
       if (parsed.orderId) {
         const orderSnap = await db.collection('orderTracker_orders')
           .where('onbuyOrderId', '==', parsed.orderId)
-          .limit(1).get();
-        if (!orderSnap.empty) orderDoc = orderSnap.docs[0];
+          .limit(1)
+          .get();
+        if (!orderSnap.empty) linkedOrderId = orderSnap.docs[0].id;
       }
 
-      const disputeId = parsed.disputeRef || `dispute_${Date.now()}`;
-      const docRef = db.collection('orderTracker_disputes').doc(disputeId);
-
-      await docRef.set({
+      const disputeData = {
         orgId: ORG_ID,
-        team,
-        account,
-        clientEmail,
-        disputeRef: parsed.disputeRef,
-        orderId: parsed.orderId,
-        orderDocId: orderDoc ? orderDoc.id : '',
-        reason: parsed.reason,
-        deadline: parsed.deadline,
+        from,
+        to,
+        subject,
+        receivedAt: now,
+        orderId: parsed.orderId || '',
+        linkedOrderId: linkedOrderId || '',
+        disputeRef: parsed.disputeRef || '',
+        reason: parsed.reason || '',
+        deadline: parsed.deadline || '',
+        type: parsed.type,
+        urgency: parsed.urgency,
+        outcome: parsed.outcome || '',
+        feeAmount: parsed.feeAmount || null,
         status: 'Open',
-        priority: 'medium',
-        receivedAt: admin.firestore.FieldValue.serverTimestamp(),
-        rawSubject: parsed.rawSubject,
-        rawBody: parsed.rawBody,
-        replyDraft: '',
-        replySent: false,
-        replySentAt: null,
+        rawText: text.slice(0, 5000),
+        rawHtml: html ? html.slice(0, 5000) : '',
+        parsedConfidence: parsed.confidence,
         notes: '',
-        assignedTo: '',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
+        replyDraft: '',
+        resolvedAt: null,
+        resolvedBy: '',
+        account: '',
+      };
 
-      logger.info(`Dispute saved: ${disputeId} for ${account} (order: ${parsed.orderId || 'unknown'})`);
-      res.json({ success: true, disputeId, parsed });
+      // If linked to order, copy account info
+      if (linkedOrderId) {
+        const orderDoc = await db.collection('orderTracker_orders').doc(linkedOrderId).get();
+        if (orderDoc.exists) {
+          const od = orderDoc.data();
+          disputeData.account = od.account || '';
+          disputeData.team = od.team || '';
+          disputeData.buyerName = od.buyerName || '';
+        }
+      }
+
+      const docRef = await db.collection('orderTracker_disputes').add(disputeData);
+      logger.info(`Dispute email parsed: ${docRef.id} | order=${parsed.orderId || 'none'} | type=${parsed.type}`);
+
+      res.json({ success: true, disputeId: docRef.id, parsed });
     } catch (e) {
       logger.error(`receiveDisputeEmail error: ${e.message}`);
       res.status(500).json({ error: e.message });
@@ -1578,61 +1623,47 @@ exports.receiveDisputeEmail = onRequest(
   }
 );
 
-// Test endpoint: parse a dispute email without saving
+// Manual test endpoint — send JSON, no SendGrid needed.
+// POST /testDisputeParse?key=...  body: {subject, text, from}
 exports.testDisputeParse = onRequest(
   { cors: true, timeoutSeconds: 30 },
   async (req, res) => {
-    try {
-      const { subject, text, html } = req.body || {};
-      if (!subject && !text && !html) {
-        return res.status(400).json({
-          error: 'Missing subject/text/html',
-          example: { subject: 'Dispute T6K27YN', text: 'Order #T6K27YN... Reason: Item not received' }
-        });
-      }
-      const parsed = parseDisputeEmail(subject, text, html);
-      res.json({ success: true, parsed });
-    } catch (e) {
-      logger.error(`testDisputeParse error: ${e.message}`);
-      res.status(500).json({ error: e.message });
-    }
+    if (!checkAdminKey(req, res)) return;
+    const { subject, text, html, from } = req.body || {};
+    if (!subject) return res.status(400).json({ error: 'Missing subject in body' });
+
+    const parsed = parseDisputeEmail(text, html, subject, from || 'test@onbuy.com');
+    res.json({ success: true, parsed });
   }
 );
 
-// Get disputes for dashboard (Admin sees all, VA sees their team only)
+// Dashboard API: read disputes with optional filters
 exports.getDisputes = onRequest(
   { cors: true, timeoutSeconds: 60 },
   async (req, res) => {
     if (!checkAdminKey(req, res)) return;
+    const { status, type, urgency, limit = 50, orderBy = 'receivedAt', orderDir = 'desc' } = req.query;
+
     try {
-      const team = req.query.team || '';
-      const status = req.query.status || '';
-      const limit = Math.min(Number(req.query.limit || 50), 100);
-
-      let q = db.collection('orderTracker_disputes').orderBy('receivedAt', 'desc');
-      if (team) q = q.where('team', '==', team);
+      let q = db.collection('orderTracker_disputes').where('orgId', '==', ORG_ID);
       if (status) q = q.where('status', '==', status);
+      if (type) q = q.where('type', '==', type);
+      if (urgency) q = q.where('urgency', '==', urgency);
 
-      const snap = await q.limit(limit).get();
-      const docs = snap.docs.map(d => {
+      q = q.orderBy(orderBy, orderDir).limit(Math.min(Number(limit), 100));
+      const snap = await q.get();
+
+      const disputes = snap.docs.map(d => {
         const data = d.data();
         return {
           id: d.id,
-          disputeRef: data.disputeRef || d.id,
-          orderId: data.orderId || '',
-          team: data.team || '',
-          account: data.account || '',
-          reason: data.reason || '',
-          status: data.status || 'Open',
-          priority: data.priority || 'medium',
-          deadline: data.deadline || '',
+          ...data,
           receivedAt: data.receivedAt && data.receivedAt.toDate ? data.receivedAt.toDate().toISOString() : null,
-          replySent: !!data.replySent,
-          assignedTo: data.assignedTo || '',
-          notes: data.notes || '',
+          resolvedAt: data.resolvedAt && data.resolvedAt.toDate ? data.resolvedAt.toDate().toISOString() : null,
         };
       });
-      res.json({ success: true, count: docs.length, disputes: docs });
+
+      res.json({ success: true, count: disputes.length, disputes });
     } catch (e) {
       logger.error(`getDisputes error: ${e.message}`);
       res.status(500).json({ error: e.message });
@@ -1640,22 +1671,27 @@ exports.getDisputes = onRequest(
   }
 );
 
-// Update dispute status / notes / assignment (dashboard action)
+// Dashboard API: update dispute status / notes / reply draft
 exports.updateDisputeStatus = onRequest(
   { cors: true, timeoutSeconds: 30 },
   async (req, res) => {
     if (!checkAdminKey(req, res)) return;
+    const { disputeId, status, notes, replyDraft, resolvedBy } = req.body || {};
+    if (!disputeId) return res.status(400).json({ error: 'Missing disputeId' });
+
+    const updates = {};
+    if (status) updates.status = status;
+    if (notes !== undefined) updates.notes = notes;
+    if (replyDraft !== undefined) updates.replyDraft = replyDraft;
+    if (resolvedBy) {
+      updates.resolvedBy = resolvedBy;
+      updates.resolvedAt = admin.firestore.FieldValue.serverTimestamp();
+    }
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'Nothing to update. Send status, notes, replyDraft, or resolvedBy.' });
+    }
+
     try {
-      const { disputeId, status, notes, assignedTo, priority, replyDraft } = req.body || {};
-      if (!disputeId) return res.status(400).json({ error: 'Missing disputeId' });
-
-      const updates = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
-      if (status !== undefined) updates.status = status;
-      if (notes !== undefined) updates.notes = notes;
-      if (assignedTo !== undefined) updates.assignedTo = assignedTo;
-      if (priority !== undefined) updates.priority = priority;
-      if (replyDraft !== undefined) updates.replyDraft = replyDraft;
-
       await db.collection('orderTracker_disputes').doc(disputeId).update(updates);
       res.json({ success: true, disputeId, updates: Object.keys(updates) });
     } catch (e) {
@@ -1666,258 +1702,12 @@ exports.updateDisputeStatus = onRequest(
 );
 
 // ============================================================================
-// IMAP DISPUTE READER — polls dispute@onlisto.io every 15 min
-// ============================================================================
-
-function openImapBox(imap, boxName) {
-  return new Promise((resolve, reject) => {
-    imap.openBox(boxName, false, (err, box) => {
-      if (err) reject(err);
-      else resolve(box);
-    });
-  });
-}
-
-function searchImap(imap, criteria) {
-  return new Promise((resolve, reject) => {
-    imap.search(criteria, (err, results) => {
-      if (err) reject(err);
-      else resolve(results || []);
-    });
-  });
-}
-
-function fetchImapMessages(imap, results, fetchOptions) {
-  return new Promise((resolve, reject) => {
-    const msgs = [];
-    if (!results.length) { resolve([]); return; }
-    const f = imap.fetch(results, fetchOptions);
-    f.on('message', (msg, seqno) => {
-      let buf = Buffer.alloc(0);
-      msg.on('body', (stream) => {
-        stream.on('data', (chunk) => { buf = Buffer.concat([buf, chunk]); });
-      });
-      msg.once('end', () => { msgs.push(buf); });
-    });
-    f.once('error', (err) => reject(err));
-    f.once('end', () => resolve(msgs));
-  });
-}
-
-async function readDisputeEmailsViaImap() {
-  const host = process.env.IMAP_HOST || 'mail.onlisto.io';
-  const port = Number(process.env.IMAP_PORT || 993);
-  const user = 'dispute@onlisto.io';
-  const password = process.env.DISPUTE_EMAIL_PASSWORD || '';
-
-  if (!password) {
-    logger.error('DISPUTE_EMAIL_PASSWORD not set in .env');
-    return { error: 'DISPUTE_EMAIL_PASSWORD not set' };
-  }
-
-  const imap = new Imap({ host, port, user, password, tls: true, tlsOptions: { rejectUnauthorized: false } });
-
-  await new Promise((resolve, reject) => {
-    imap.once('ready', resolve);
-    imap.once('error', reject);
-    imap.connect();
-  });
-
-  try {
-    await openImapBox(imap, 'INBOX');
-    // Search UNSEEN emails from OnBuy support
-    const results = await searchImap(imap, [['UNSEEN'], ['FROM', 'customersupport-gb@onbuy.com']]);
-    logger.info(`IMAP: ${results.length} unseen OnBuy dispute emails found`);
-
-    if (!results.length) {
-      imap.end();
-      return { processed: 0, found: 0 };
-    }
-
-    const msgs = await fetchImapMessages(imap, results, { bodies: '', markSeen: true });
-    let processed = 0;
-
-    for (const buf of msgs) {
-      try {
-        const parsed = await simpleParser(buf);
-        const disputeData = parseDisputeEmail(parsed.subject, parsed.text, parsed.html);
-
-        // Determine team/client from To header or fallback
-        let team = '';
-        let account = '';
-        let clientEmail = '';
-        const toHeader = String(parsed.to && parsed.to.text || '').toLowerCase();
-        if (toHeader.includes('panacea') || toHeader.includes('slidaro')) {
-          team = 'panacea'; account = 'Panacea'; clientEmail = 'slidaro@onlisto.io';
-        } else if (toHeader.includes('samay') || toHeader.includes('samayy')) {
-          team = 'samayy'; account = 'Samayy'; clientEmail = 'samay@onlisto.io';
-        } else {
-          team = 'unknown'; account = 'Unknown';
-        }
-
-        // Link to order if possible
-        let orderDoc = null;
-        if (disputeData.orderId) {
-          const orderSnap = await db.collection('orderTracker_orders')
-            .where('onbuyOrderId', '==', disputeData.orderId)
-            .limit(1).get();
-          if (!orderSnap.empty) orderDoc = orderSnap.docs[0];
-        }
-
-        const disputeId = disputeData.disputeRef || `dispute_${Date.now()}_${processed}`;
-        await db.collection('orderTracker_disputes').doc(disputeId).set({
-          orgId: ORG_ID,
-          team,
-          account,
-          clientEmail,
-          disputeRef: disputeData.disputeRef,
-          orderId: disputeData.orderId,
-          orderDocId: orderDoc ? orderDoc.id : '',
-          reason: disputeData.reason,
-          deadline: disputeData.deadline,
-          status: 'Open',
-          priority: 'medium',
-          receivedAt: admin.firestore.FieldValue.serverTimestamp(),
-          rawSubject: parsed.subject || '',
-          rawBody: disputeData.rawBody,
-          replyDraft: '',
-          replySent: false,
-          replySentAt: null,
-          notes: '',
-          assignedTo: '',
-          imapUid: results[processed],
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-
-        processed++;
-        logger.info(`IMAP dispute saved: ${disputeId} (${account})`);
-      } catch (parseErr) {
-        logger.error(`IMAP parse error: ${parseErr.message}`);
-      }
-    }
-
-    imap.end();
-    return { processed, found: results.length };
-  } catch (e) {
-    imap.end();
-    throw e;
-  }
-}
-
-// Scheduled: every 15 minutes
-exports.scheduledImapReader = onSchedule(
-  { schedule: 'every 15 minutes', timeoutSeconds: 300, memory: '512MiB' },
-  async () => {
-    try {
-      const result = await readDisputeEmailsViaImap();
-      logger.info(`scheduledImapReader done: ${JSON.stringify(result)}`);
-    } catch (e) {
-      logger.error(`scheduledImapReader error: ${e.message}`);
-    }
-  }
-);
-
-// Manual test: /testImapConnection?key=...
-exports.testImapConnection = onRequest(
-  { timeoutSeconds: 60, memory: '256MiB' },
-  async (req, res) => {
-    if (!checkAdminKey(req, res)) return;
-    try {
-      const result = await readDisputeEmailsViaImap();
-      res.json({ success: true, result });
-    } catch (e) {
-      logger.error(`testImapConnection error: ${e.message}`);
-      res.status(500).json({ success: false, error: e.message });
-    }
-  }
-);
-
-// ============================================================================
-// ONE-CLICK DISPUTE REPLY — sends email from client's configured address
-// ============================================================================
-
-async function getClientSmtpConfig(team) {
-  // Look up client in orderTracker_clients by team
-  const snap = await db.collection('orderTracker_clients')
-    .where('team', '==', team)
-    .limit(1).get();
-  if (snap.empty) return null;
-  const c = snap.docs[0].data();
-  const envVarName = c.smtpPasswordEnvVar || '';
-  const password = envVarName ? (process.env[envVarName] || '') : '';
-  return {
-    host: c.smtpHost || 'smtp.gmail.com',
-    port: Number(c.smtpPort || 587),
-    user: c.smtpUser || c.replyFromEmail || '',
-    pass: password,
-    fromEmail: c.replyFromEmail || c.smtpUser || '',
-    fromName: c.replyFromName || c.name || 'Onlisto Support',
-  };
-}
-
-exports.sendDisputeReply = onRequest(
-  { cors: true, timeoutSeconds: 60, memory: '256MiB' },
-  async (req, res) => {
-    if (!checkAdminKey(req, res)) return;
-    try {
-      const { disputeId, replyBody, sendTestOnly } = req.body || {};
-      if (!disputeId || !replyBody) {
-        return res.status(400).json({ error: 'Missing disputeId or replyBody' });
-      }
-
-      const disputeSnap = await db.collection('orderTracker_disputes').doc(disputeId).get();
-      if (!disputeSnap.exists) return res.status(404).json({ error: 'Dispute not found' });
-      const dispute = disputeSnap.data();
-
-      const smtp = await getClientSmtpConfig(dispute.team);
-      if (!smtp || !smtp.pass) {
-        return res.status(500).json({
-          error: 'SMTP not configured for this client. Add replyFromEmail + smtpPasswordEnvVar in client settings.',
-          team: dispute.team,
-        });
-      }
-
-      if (sendTestOnly) {
-        return res.json({
-          success: true,
-          testMode: true,
-          wouldSendFrom: smtp.fromEmail,
-          wouldSendTo: 'customersupport-gb@onbuy.com',
-          subject: `Re: ${dispute.rawSubject || 'Dispute ' + dispute.disputeRef}`,
-          bodyPreview: replyBody.slice(0, 200),
-        });
-      }
-
-      const transporter = nodemailer.createTransport({
-        host: smtp.host,
-        port: smtp.port,
-        secure: smtp.port === 465,
-        auth: { user: smtp.user, pass: smtp.pass },
-      });
-
-      const info = await transporter.sendMail({
-        from: `"${smtp.fromName}" <${smtp.fromEmail}>`,
-        to: 'customersupport-gb@onbuy.com',
-        subject: `Re: ${dispute.rawSubject || 'Dispute ' + dispute.disputeRef}`,
-        text: replyBody,
-        replyTo: smtp.fromEmail,
-      });
-
-      await disputeSnap.ref.update({
-        replySent: true,
-        replySentAt: admin.firestore.FieldValue.serverTimestamp(),
-        replyBody: replyBody,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      logger.info(`Dispute reply sent: ${disputeId} from ${smtp.fromEmail} → OnBuy. MessageId: ${info.messageId}`);
-      res.json({ success: true, messageId: info.messageId, sentFrom: smtp.fromEmail });
-    } catch (e) {
-      logger.error(`sendDisputeReply error: ${e.message}`);
-      res.status(500).json({ error: e.message });
-    }
-  }
-);
-
+// INTENTIONALLY REMOVED (legacy — Firebase will offer to delete these, type Y):
+//   migrateAll, migrateOrders, migrateListings (v1, one-time, already ran)
+//   migrateData (open collection copier — security risk)
+//   cleanupDuplicates (one-time, already ran 21 Jul)
+//   testScrapingBee (debug tool, no longer needed)
+//   getLiveDataV2 (reborn as the read-only getLiveData API above)
+//   sendSignupCode, verifySignupCode (signup flow not in use)
+//   pullOnBuyListingsHourly (replaced by paginated pullOnBuyListings above)
 // ============================================================================

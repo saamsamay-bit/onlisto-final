@@ -405,6 +405,30 @@
             color: #fff !important;
             font-weight: 800;
         }
+
+        /* ---------- DISPUTES V2 (email parser integration, 29 Jul 2026) ---------- */
+        .dispute-badge-type-chargeback { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+        .dispute-badge-type-escalation { background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; }
+        .dispute-badge-type-not_received { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }
+        .dispute-badge-type-not_as_described { background: #fefce8; color: #a16207; border: 1px solid #fde68a; }
+        .dispute-badge-type-return { background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
+        .dispute-badge-type-refund { background: #faf5ff; color: #6b21a8; border: 1px solid #e9d5ff; }
+        .dispute-badge-urgency-high { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; animation: pulseSoft 1.2s infinite; }
+        .dispute-badge-urgency-medium { background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; }
+        .dispute-badge-urgency-normal { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
+        .dispute-row-urgent { background: #fff5f5 !important; }
+        .dispute-row-urgent:hover { background: #feecec !important; }
+        .dispute-detail-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 14px; }
+        .dispute-detail-grid .detail-field label { display: block; font-size: 11px; font-weight: 800; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; margin-bottom: 3px; }
+        .dispute-detail-grid .detail-field .detail-value { font-size: 14px; font-weight: 700; color: var(--ink); }
+        .dispute-detail-grid .detail-field.full-width { grid-column: 1 / -1; }
+        .dispute-raw { background: #f8fafc; border: 1px solid var(--line); border-radius: 10px; padding: 12px; font-size: 12px; color: #64748b; max-height: 160px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+        .reply-generator-box { background: #f5f7ff; border: 1.5px solid #c7d2fe; border-radius: 14px; padding: 16px; margin: 14px 0; }
+        .reply-generator-box label { font-size: 12px; font-weight: 800; color: var(--indigo); display: block; margin-bottom: 8px; }
+        .reply-generator-box textarea { width: 100%; background: #fff; border: 1.5px solid #c7d2fe; border-radius: 10px; padding: 12px; font-size: 13px; min-height: 120px; font-family: inherit; }
+        .dispute-filters { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
+        .dispute-filters select, .dispute-filters input { padding: 8px 12px; border: 1.5px solid var(--line); border-radius: 10px; font-family: inherit; font-size: 13px; background: #fff; }
+        .dispute-filters input { flex: 1; min-width: 180px; }
     </style>
 </head>
 <body>
@@ -593,7 +617,92 @@
                 <button class="btn btn-soft" onclick="copyReply()">Copy to Clipboard</button>
                 <button class="btn btn-success" onclick="markReplied()">Copy &amp; Mark as Replied</button>
             </div>
+    
+    <!-- ================= DISPUTE DETAIL MODAL (v2) ================= -->
+    <div id="disputeDetailModal" class="modal-overlay hidden">
+        <div class="modal wide">
+            <h3 id="ddTitle">Dispute Detail</h3>
+            <div class="sub" id="ddSub">View full dispute info, generate reply draft, update status</div>
+
+            <div class="dispute-detail-grid">
+                <div class="detail-field">
+                    <label>Order ID</label>
+                    <div id="ddOrderId" class="detail-value">—</div>
+                </div>
+                <div class="detail-field">
+                    <label>Dispute Ref</label>
+                    <div id="ddDisputeRef" class="detail-value">—</div>
+                </div>
+                <div class="detail-field">
+                    <label>Type</label>
+                    <div id="ddType" class="detail-value">—</div>
+                </div>
+                <div class="detail-field">
+                    <label>Urgency</label>
+                    <div id="ddUrgency" class="detail-value">—</div>
+                </div>
+                <div class="detail-field">
+                    <label>Fee Amount</label>
+                    <div id="ddFee" class="detail-value">—</div>
+                </div>
+                <div class="detail-field">
+                    <label>Received</label>
+                    <div id="ddReceived" class="detail-value">—</div>
+                </div>
+            </div>
+
+            <div class="detail-field full-width">
+                <label>Subject</label>
+                <div id="ddSubject" class="detail-value" style="font-size:13px;color:var(--muted)">—</div>
+            </div>
+
+            <div class="detail-field full-width">
+                <label>Reason</label>
+                <div id="ddReason" class="detail-value">—</div>
+            </div>
+
+            <div class="detail-field full-width">
+                <label>Outcome</label>
+                <div id="ddOutcome" class="detail-value">—</div>
+            </div>
+
+            <div class="detail-field full-width">
+                <label>Raw Email (first 1000 chars)</label>
+                <pre id="ddRaw" class="dispute-raw">No raw text saved.</pre>
+            </div>
+
+            <!-- Reply Draft Generator -->
+            <div class="reply-generator-box">
+                <label>🤖 AI Reply Draft Generator</label>
+                <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+                    <button onclick="generateDisputeReply()" class="btn btn-primary btn-sm">Generate Draft</button>
+                    <button onclick="copyDisputeReply()" class="btn btn-soft btn-sm">📋 Copy</button>
+                </div>
+                <textarea id="ddReplyDraft" placeholder="Click 'Generate Draft' to create a reply based on dispute type..."></textarea>
+            </div>
+
+            <!-- Notes -->
+            <div class="detail-field full-width">
+                <label>Internal Notes</label>
+                <textarea id="ddNotes" class="inp" rows="3" placeholder="Add internal notes..."></textarea>
+            </div>
+
+            <!-- Status Update -->
+            <div style="display:flex;gap:12px;align-items:center;margin-top:14px;padding-top:14px;border-top:1px dashed var(--line)">
+                <label style="font-size:12px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.6px">Update Status</label>
+                <select id="ddStatusSelect" style="width:auto">
+                    <option value="Open">Open</option>
+                    <option value="In Progress">In Progress</option>
+                    <option value="Resolved">Resolved</option>
+                    <option value="Ignored">Ignored</option>
+                </select>
+                <button onclick="saveDisputeDetail()" class="btn btn-success">💾 Save Changes</button>
+                <button onclick="sendDisputeReply()" class="btn btn-primary" id="ddSendReplyBtn" style="display:none">📧 Send Reply</button>
+                <button onclick="closeModal('disputeDetailModal')" class="btn btn-ghost">Close</button>
+            </div>
         </div>
+    </div>
+    </div>
     </div>
 
     <!-- ================= RESTOCK MODAL ================= -->
@@ -619,13 +728,53 @@
             <input type="text" id="cName" class="inp" placeholder="e.g. Smith Trading Ltd">
             <div class="two-col">
                 <div>
+                    <label class="f" for="cAccount">Account / Team</label>
+                    <select id="cAccount" class="inp" style="width:100%">
+                        <option value="samayy">Samayy</option>
+                        <option value="panacea">Panacea</option>
+                    </select>
+                </div>
+                <div>
                     <label class="f" for="cOnbuyEmail">OnBuy login email</label>
                     <input type="text" id="cOnbuyEmail" class="inp" placeholder="client@gmail.com">
                 </div>
+            </div>
+            <div class="two-col">
                 <div>
                     <label class="f" for="cDisputeEmail">Dispute inbox</label>
                     <input type="text" id="cDisputeEmail" class="inp" placeholder="disputes+client@onlisto.io">
                 </div>
+                <div>
+                    <label class="f" for="cReplyFromEmail">Reply-from Email (what OnBuy sees)</label>
+                    <input type="text" id="cReplyFromEmail" class="inp" placeholder="sn1@slidaro.com">
+                </div>
+            </div>
+            <div class="two-col">
+                <div>
+                    <label class="f" for="cReplyFromName">Reply-from Name</label>
+                    <input type="text" id="cReplyFromName" class="inp" placeholder="Samay Support">
+                </div>
+                <div>
+                    <label class="f" for="cSmtpHost">SMTP Host</label>
+                    <input type="text" id="cSmtpHost" class="inp" placeholder="smtp.gmail.com">
+                </div>
+            </div>
+            <div class="two-col">
+                <div>
+                    <label class="f" for="cSmtpPort">SMTP Port</label>
+                    <input type="number" id="cSmtpPort" class="inp" value="587" min="1" max="65535">
+                </div>
+                <div>
+                    <label class="f" for="cSmtpUser">SMTP User</label>
+                    <input type="text" id="cSmtpUser" class="inp" placeholder="sn1@slidaro.com">
+                </div>
+            </div>
+            <div class="two-col">
+                <div>
+                    <label class="f" for="cSmtpPasswordEnvVar">SMTP Password Env Var Name</label>
+                    <input type="text" id="cSmtpPasswordEnvVar" class="inp" placeholder="SMTP_SN1_SLIDARO">
+                </div>
+                <div></div>
             </div>
             <div class="two-col">
                 <div>
@@ -1037,12 +1186,12 @@
             </div>
         </section>
 
-        <!-- ================= DISPUTES TAB ================= -->
+        <!-- ================= DISPUTES TAB (v2 — email parser integration, 29 Jul 2026) ================= -->
         <section id="disputesTab" class="hidden">
             <div class="mini-grid anim-fadeUp">
-                <div class="mini"><p>Urgent · &lt;24h left</p><h4 id="disUrgent" style="color:var(--red)">0</h4></div>
+                <div class="mini"><p>High Urgency</p><h4 id="disUrgent" style="color:var(--red)">0</h4></div>
                 <div class="mini"><p>Open disputes</p><h4 id="disOpen" style="color:var(--amber)">0</h4></div>
-                <div class="mini"><p>Awaiting buyer / OnBuy</p><h4 id="disWaiting" style="color:var(--sky)">0</h4></div>
+                <div class="mini"><p>Total Fees</p><h4 id="disFees" style="color:var(--red)">£0.00</h4></div>
                 <div class="mini"><p>Resolved</p><h4 id="disResolved" style="color:var(--green)">0</h4></div>
             </div>
 
@@ -1050,25 +1199,57 @@
                 <div class="card-head">
                     <div>
                         <h2>Dispute Command</h2>
-                        <div class="sub">Live from <span class="mono">orderTracker_disputes</span> · reply before the deadline or OnBuy auto-refunds the buyer</div>
+                        <div class="sub">Auto-imported from OnBuy emails + manual entries · reply before deadline or OnBuy auto-refunds</div>
                     </div>
-                    <button class="btn btn-primary" onclick="openAddDispute()">+ Log Dispute Manually</button>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap">
+                        <button class="btn btn-primary" onclick="openAddDispute()">+ Log Manually</button>
+                        <button class="btn btn-soft" onclick="loadDisputesFromApi()">🔄 Refresh</button>
+                    </div>
                 </div>
+
+                <!-- Filters -->
+                <div class="dispute-filters">
+                    <select id="disputeFilterStatus" onchange="loadDisputesFromApi()">
+                        <option value="">All Status</option>
+                        <option value="Open" selected>Open</option>
+                        <option value="In Progress">In Progress</option>
+                        <option value="Resolved">Resolved</option>
+                    </select>
+                    <select id="disputeFilterType" onchange="loadDisputesFromApi()">
+                        <option value="">All Types</option>
+                        <option value="Chargeback">Chargeback</option>
+                        <option value="Escalation">Escalation</option>
+                        <option value="Not Received">Not Received</option>
+                        <option value="Not As Described">Not As Described</option>
+                        <option value="Return">Return</option>
+                        <option value="Refund">Refund</option>
+                    </select>
+                    <select id="disputeFilterUrgency" onchange="loadDisputesFromApi()">
+                        <option value="">All Urgency</option>
+                        <option value="High">High</option>
+                        <option value="Medium">Medium</option>
+                        <option value="Normal">Normal</option>
+                    </select>
+                    <input type="text" id="disputeSearch" placeholder="Search order ID or ref…" onkeyup="if(event.key==='Enter')loadDisputesFromApi()">
+                </div>
+
                 <div class="table-wrap">
                     <table>
                         <thead>
                             <tr>
-                                <th>Order / Reference</th>
-                                <th>Account</th>
+                                <th>Received</th>
+                                <th>Order ID</th>
+                                <th>Dispute Ref</th>
+                                <th>Type</th>
                                 <th>Reason</th>
-                                <th>Deadline</th>
-                                <th>Details</th>
+                                <th>Fee</th>
+                                <th>Urgency</th>
                                 <th>Status</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody id="disputesTableBody">
-                            <tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">No disputes logged yet. When the email parser goes live they will appear here automatically.</td></tr>
+                            <tr><td colspan="9" style="text-align:center;padding:40px;color:var(--muted)">Loading disputes…</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1081,15 +1262,14 @@
                         <ol>
                             <li>In the client's Gmail, open <b>Settings → Forwarding and POP/IMAP → Add a forwarding address</b>.</li>
                             <li>Enter their dispute inbox: <code>disputes+clientname@onlisto.io</code> and confirm the verification email (it arrives in your Onlisto inbox).</li>
-                            <li>Go to <b>Settings → Filters → Create a new filter</b>: in <b>From</b> put <code>@onbuy.com</code>, in <b>Has the words</b> put <code>dispute OR case OR claim</code>.</li>
+                            <li>Go to <b>Settings → Filters → Create a new filter</b>: in <b>From</b> put <code>customersupport-gb@onbuy.com</code>, in <b>Has the words</b> put <code>dispute OR chargeback OR escalation OR "we need your help"</code>.</li>
                             <li>Click <b>Create filter</b> → tick <b>Forward it to:</b> and choose <code>disputes+clientname@onlisto.io</code> → <b>Create filter</b>.</li>
                         </ol>
-                        <p style="margin:10px 0 0">Once the Cloud Function parser is deployed (backend step), every forwarded email is read automatically: order ID, dispute reference, reason, deadline and attachments are extracted and appear in the table above with the countdown running.</p>
+                        <p style="margin:10px 0 0">The Cloud Function parser reads every forwarded email automatically: order ID, dispute reference, reason, deadline, fee amount and type are extracted and appear in the table above. When a real email arrives, the parser patterns are refined in one patch.</p>
                     </div>
                 </details>
             </div>
         </section>
-
         <!-- ================= VA STATS TAB ================= -->
         <section id="vaTab" class="hidden">
             <div class="mini-grid anim-fadeUp">
@@ -2731,14 +2911,51 @@ async function saveSplitPercentages(){
             }
         }
 
-        /* ================= DISPUTES ================= */
+        /* ================= DISPUTES (v2 — email parser + API integration, 29 Jul 2026) ================= */
+        const API_BASE = 'https://us-central1-tokaxis-b7339.cloudfunctions.net';
+        let apiDisputes = [];
+        let currentDisputeId = null;
+
         const REASON_LABELS = { not_received: 'Not received', wrong_item: 'Wrong item', damaged: 'Damaged / faulty', escalation: 'Escalation', other: 'Other' };
         const TEMPLATES = {
-            not_received: d => `Hello,\n\nWe are very sorry that your order ${d.orderId || ''} has not arrived. We have checked with the courier and opened an investigation (reference ${d.disputeRef || 'N/A'}).\n\nIf the parcel does not arrive within the next 48 hours we will issue a full refund immediately — you will not be left out of pocket.\n\nThank you for your patience.`,
-            wrong_item: d => `Hello,\n\nWe sincerely apologise for sending the wrong item on order ${d.orderId || ''}. This was our picking error.\n\nPlease reply with a photo of the item you received so we can confirm, and we will immediately arrange either the correct item or a full refund — whichever you prefer. Return postage is on us.\n\nAgain, our apologies for the inconvenience.`,
-            damaged: d => `Hello,\n\nWe are very sorry your item from order ${d.orderId || ''} arrived damaged/faulty.\n\nPlease send a photo showing the issue and we will resolve this today — replacement or full refund, your choice. There is no need to return the damaged item in most cases.\n\nThank you for giving us the chance to put this right.`,
-            escalation: d => `Hello,\n\nRegarding order ${d.orderId || ''} (dispute ${d.disputeRef || 'N/A'}):\n\nEvidence attached:\n- Proof of dispatch with tracking number\n- Screenshot of the listing at time of sale\n- Full message history with the buyer\n\nWe have responded to every buyer message within 24 hours and remain happy to offer a fair resolution. Please review the evidence and contact us before making a final decision.\n\nKind regards.`,
-            refund_done: d => `Hello,\n\nA full refund for order ${d.orderId || ''} has already been issued on our side. Depending on your bank it can take 2-3 working days to appear.\n\nThank you for your patience, and apologies again for the trouble.`
+            not_received: d => `Hello,
+
+We are very sorry that your order ${d.orderId || ''} has not arrived. We have checked with the courier and opened an investigation (reference ${d.disputeRef || 'N/A'}).
+
+If the parcel does not arrive within the next 48 hours we will issue a full refund immediately — you will not be left out of pocket.
+
+Thank you for your patience.`,
+            wrong_item: d => `Hello,
+
+We sincerely apologise for sending the wrong item on order ${d.orderId || ''}. This was our picking error.
+
+Please reply with a photo of the item you received so we can confirm, and we will immediately arrange either the correct item or a full refund — whichever you prefer. Return postage is on us.
+
+Again, our apologies for the inconvenience.`,
+            damaged: d => `Hello,
+
+We are very sorry your item from order ${d.orderId || ''} arrived damaged/faulty.
+
+Please send a photo showing the issue and we will resolve this today — replacement or full refund, your choice. There is no need to return the damaged item in most cases.
+
+Thank you for giving us the chance to put this right.`,
+            escalation: d => `Hello,
+
+Regarding order ${d.orderId || ''} (dispute ${d.disputeRef || 'N/A'}):
+
+Evidence attached:
+- Proof of dispatch with tracking number
+- Screenshot of the listing at time of sale
+- Full message history with the buyer
+
+We have responded to every buyer message within 24 hours and remain happy to offer a fair resolution. Please review the evidence and contact us before making a final decision.
+
+Kind regards.`,
+            refund_done: d => `Hello,
+
+A full refund for order ${d.orderId || ''} has already been issued on our side. Depending on your bank it can take 2-3 working days to appear.
+
+Thank you for your patience, and apologies again for the trouble.`
         };
 
         function disputeDeadline(d) {
@@ -2747,9 +2964,10 @@ async function saveSplitPercentages(){
             const t = new Date(d.deadline);
             return isNaN(t) ? null : t;
         }
+
         function deadlineChip(d) {
             const dl = disputeDeadline(d);
-            const closed = d.status === 'Resolved' || d.status === 'Closed';
+            const closed = d.status === 'Resolved' || d.status === 'Closed' || d.status === 'Ignored';
             if (!dl) return '<span class="badge badge-neutral">No deadline</span>';
             const ms = dl - Date.now();
             if (closed) return '<span class="badge badge-success">Done</span>';
@@ -2763,72 +2981,317 @@ async function saveSplitPercentages(){
             return `<span class="badge badge-neutral">${days}d left</span>`;
         }
 
-        function watchDisputes() {
-            onSnapshot(query(collection(db, "orderTracker_disputes"), orderBy("createdAt", "desc"), limit(100)), snap => {
-                disputes = [];
-                snap.forEach(d => disputes.push({ id: d.id, ...d.data() }));
-                renderDisputes();
-            }, err => console.warn('disputes listener:', err.message));
+        function getDisputeTypeClass(type) {
+            const t = String(type || 'Other').toLowerCase().replace(/\s+/g, '_');
+            return `dispute-badge-type-${t}`;
         }
 
-        function getVisibleDisputes() {
-            const acc = vaAccount();
-            if (!acc) return disputes;
-            return disputes.filter(d => {
-                if (d.team === acc) return true;
-                return (d.account || '').toLowerCase().includes(acc === 'panacea' ? 'panacea' : 'samay');
-            });
+        function getDisputeUrgencyClass(u) {
+            const v = String(u || 'Normal').toLowerCase();
+            return `dispute-badge-urgency-${v}`;
         }
 
-        function renderDisputes() {
-            const list = getVisibleDisputes();
-            const isActive = s => s !== 'Resolved' && s !== 'Closed';
-            const urgent = list.filter(d => { const dl = disputeDeadline(d); return isActive(d.status || 'Open') && dl && (dl - Date.now()) < 24 * 36e5; }).length;
+        // Load disputes — Admin uses API (server-side filtering), VAs use Firestore (client-side filtering)
+        window.loadDisputesFromApi = async function() {
+            const tbody = $('disputesTableBody');
+            tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--muted)">Loading disputes…</td></tr>';
+
+            const status = $('disputeFilterStatus').value;
+            const type = $('disputeFilterType').value;
+            const urgency = $('disputeFilterUrgency').value;
+            const search = $('disputeSearch').value.trim().toLowerCase();
+
+            // VAs don't have ADMIN_KEY — use client-side filtering on Firestore data
+            if (!isAdmin()) {
+                let filtered = [...disputes];
+                // Scope to VA's account
+                const acc = vaAccount();
+                if (acc) {
+                    filtered = filtered.filter(d => {
+                        if (d.team === acc) return true;
+                        return (d.account || '').toLowerCase().includes(acc === 'panacea' ? 'panacea' : 'samay');
+                    });
+                }
+                if (status) filtered = filtered.filter(d => (d.status || 'Open') === status);
+                if (type) filtered = filtered.filter(d => (d.type || 'Other') === type);
+                if (urgency) filtered = filtered.filter(d => (d.urgency || 'Normal') === urgency);
+                if (search) {
+                    filtered = filtered.filter(d =>
+                        (d.orderId || '').toLowerCase().includes(search) ||
+                        (d.disputeRef || '').toLowerCase().includes(search) ||
+                        (d.reason || '').toLowerCase().includes(search)
+                    );
+                }
+                renderDisputesV2(filtered);
+                return;
+            }
+
+            // Admin: use API for server-side filtering
+            let url = `${API_BASE}/getDisputes?key=Katimatitati99@&limit=100`;
+            if (status) url += `&status=${encodeURIComponent(status)}`;
+            if (type) url += `&type=${encodeURIComponent(type)}`;
+            if (urgency) url += `&urgency=${encodeURIComponent(urgency)}`;
+
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+                if (!data.success) throw new Error(data.error);
+                apiDisputes = data.disputes || [];
+                if (search) {
+                    apiDisputes = apiDisputes.filter(d =>
+                        (d.orderId || '').toLowerCase().includes(search) ||
+                        (d.disputeRef || '').toLowerCase().includes(search) ||
+                        (d.reason || '').toLowerCase().includes(search)
+                    );
+                }
+                renderDisputesV2(apiDisputes);
+            } catch (e) {
+                console.warn('API load failed, falling back to Firestore:', e.message);
+                renderDisputesV2(disputes);
+            }
+        };
+
+        function renderDisputesV2(list) {
+            const isActive = s => s !== 'Resolved' && s !== 'Closed' && s !== 'Ignored';
+            const urgent = list.filter(d => isActive(d.status || 'Open') && d.urgency === 'High').length;
             const open = list.filter(d => (d.status || 'Open') === 'Open').length;
-            const waiting = list.filter(d => d.status === 'Replied' || d.status === 'Escalated').length;
             const resolved = list.filter(d => !isActive(d.status || 'Open')).length;
+            const totalFees = list.filter(d => isActive(d.status || 'Open')).reduce((sum, d) => sum + (d.feeAmount || 0), 0);
+
             $('disUrgent').textContent = urgent;
             $('disOpen').textContent = open;
-            $('disWaiting').textContent = waiting;
+            $('disFees').textContent = fmt(totalFees);
             $('disResolved').textContent = resolved;
             $('disputePill').classList.toggle('hidden', urgent === 0);
             $('disputePillText').textContent = `${urgent} urgent dispute${urgent === 1 ? '' : 's'}`;
 
             const tbody = $('disputesTableBody');
             if (!list.length) {
-                tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">No disputes logged yet. When the email parser goes live they will appear here automatically.</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--muted)">No disputes found. When OnBuy dispute emails arrive they appear here automatically.</td></tr>`;
                 return;
             }
+
             tbody.innerHTML = list.map(d => {
-                const isPan = d.team === 'panacea';
-                const status = d.status || 'Open';
-                const details = String(d.details || '');
-                return `<tr>
-                    <td><span class="mono">${esc(d.orderId || 'N/A')}</span><br><span class="small muted">Ref: ${esc(d.disputeRef || '—')}</span></td>
-                    <td><span class="badge ${isPan ? 'badge-panacea' : 'badge-samayy'}">${esc(d.account || 'N/A')}</span></td>
-                    <td><span class="badge ${d.reason === 'escalation' ? 'badge-danger' : 'badge-warning'}">${esc(REASON_LABELS[d.reason] || d.reason || 'Other')}</span></td>
-                    <td>${deadlineChip(d)}</td>
-                    <td class="small muted" style="max-width:230px">${esc(details.length > 120 ? details.slice(0, 120) + '…' : details) || '—'}</td>
-                    <td><select onchange="setDisputeStatus('${d.id}', this.value)" style="font-size:12px">
-                        ${['Open', 'Replied', 'Escalated', 'Resolved', 'Closed'].map(s => `<option ${s === status ? 'selected' : ''}>${s}</option>`).join('')}
-                    </select></td>
+                const date = d.receivedAt ? new Date(d.receivedAt).toLocaleDateString('en-GB') : '—';
+                const fee = d.feeAmount ? `£${d.feeAmount.toFixed(2)}` : '—';
+                const typeClass = getDisputeTypeClass(d.type);
+                const urgencyClass = getDisputeUrgencyClass(d.urgency);
+                const isUrgent = d.urgency === 'High';
+                const statusBadge = d.status === 'Open' ? 'badge-danger'
+                    : d.status === 'Resolved' ? 'badge-success'
+                    : d.status === 'In Progress' ? 'badge-warning'
+                    : 'badge-neutral';
+
+                return `<tr ${isUrgent ? 'class="dispute-row-urgent"' : ''}>
+                    <td class="small">${date}</td>
+                    <td><strong class="mono">${esc(d.orderId || '—')}</strong></td>
+                    <td class="small">${esc(d.disputeRef || '—')}</td>
+                    <td><span class="badge ${typeClass}">${esc(d.type || 'Other')}</span></td>
+                    <td class="small" style="max-width:200px">${esc(d.reason || '—')}</td>
+                    <td style="font-weight:800;color:var(--red)">${fee}</td>
+                    <td><span class="badge ${urgencyClass}">${esc(d.urgency || 'Normal')}</span></td>
+                    <td><span class="badge ${statusBadge}">${esc(d.status || 'Open')}</span></td>
                     <td>
-                        <button onclick="openReply('${d.id}')" class="btn btn-primary btn-sm" style="margin-bottom:6px">Reply</button>
-                        ${status !== 'Resolved' ? `<button onclick="resolveDispute('${d.id}')" class="btn btn-success btn-sm">Resolve</button>` : ''}
+                        <button onclick="openDisputeDetail('${d.id}')" class="btn btn-primary btn-sm" style="margin-bottom:4px">View</button>
+                        ${d.status !== 'Resolved' ? `<button onclick="quickResolveDispute('${d.id}')" class="btn btn-success btn-sm">Resolve</button>` : ''}
                     </td>
                 </tr>`;
             }).join('');
         }
 
-        window.setDisputeStatus = async function(id, status) {
+        // Firestore listener (real-time updates for ALL users — VAs see their account's disputes)
+        function watchDisputes() {
+            onSnapshot(query(collection(db, "orderTracker_disputes"), orderBy("receivedAt", "desc"), limit(100)), snap => {
+                disputes = [];
+                snap.forEach(d => disputes.push({ id: d.id, ...d.data() }));
+                // For VAs: always re-render from Firestore (they use client-side filtering)
+                // For Admin: only re-render if no API filters are active
+                if (!isAdmin()) {
+                    loadDisputesFromApi(); // triggers client-side filter path
+                } else if (!$('disputeFilterStatus').value && !$('disputeFilterType').value && !$('disputeFilterUrgency').value && !$('disputeSearch').value) {
+                    renderDisputesV2(disputes);
+                }
+            }, err => console.warn('disputes listener:', err.message));
+        }
+
+        // Detail modal
+        window.openDisputeDetail = function(id) {
+            // Try API data first, then Firestore
+            let d = apiDisputes.find(x => x.id === id);
+            if (!d) d = disputes.find(x => x.id === id);
+            if (!d) return;
+            currentDisputeId = id;
+
+            $('ddTitle').textContent = `Dispute ${esc(d.disputeRef || d.orderId || 'Detail')}`;
+            $('ddSub').textContent = `From: ${esc(d.from || 'OnBuy Support')} · Type: ${esc(d.type || 'Other')}`;
+            $('ddOrderId').textContent = d.orderId || '—';
+            $('ddDisputeRef').textContent = d.disputeRef || '—';
+            $('ddType').textContent = d.type || 'Other';
+            $('ddUrgency').textContent = d.urgency || 'Normal';
+            $('ddFee').textContent = d.feeAmount ? `£${d.feeAmount.toFixed(2)}` : '—';
+            $('ddReceived').textContent = d.receivedAt ? new Date(d.receivedAt).toLocaleString('en-GB') : '—';
+            $('ddSubject').textContent = d.subject || '—';
+            $('ddReason').textContent = d.reason || '—';
+            $('ddOutcome').textContent = d.outcome || '—';
+            $('ddRaw').textContent = d.rawText || 'No raw text saved.';
+            $('ddReplyDraft').value = d.replyDraft || '';
+            $('ddNotes').value = d.notes || '';
+            $('ddStatusSelect').value = d.status || 'Open';
+            $('ddSendReplyBtn').style.display = isAdmin() ? '' : 'none';
+
+            $('disputeDetailModal').classList.remove('hidden');
+        };
+
+        window.generateDisputeReply = function() {
+            const d = apiDisputes.find(x => x.id === currentDisputeId) || disputes.find(x => x.id === currentDisputeId);
+            if (!d) return;
+
+            const orderId = d.orderId || 'the order';
+            const disputeRef = d.disputeRef || 'N/A';
+            let draft = '';
+
+            if (d.type === 'Chargeback' || d.type === 'Not Received') {
+                draft = `Dear OnBuy Support,
+
+Re: Order ${orderId} / Dispute Ref: ${disputeRef}
+
+`;
+                if (d.reason && d.reason.includes('not received')) {
+                    draft += `We can confirm that this order was dispatched on [DATE] via [CARRIER] with tracking number [TRACKING].
+
+Tracking URL: [URL]
+
+The item was delivered to the customer's address on [DATE] and signed for by [NAME].
+
+Please find attached:
+- Proof of dispatch
+- Tracking confirmation
+- Delivery confirmation
+
+We believe this dispute has been raised in error and respectfully request that you review the evidence provided.
+
+Best regards,
+[Your Name]`;
+                } else {
+                    draft += `We have reviewed this dispute and would like to provide the following information:
+
+[Add your specific response here]
+
+Best regards,
+[Your Name]`;
+                }
+            } else if (d.type === 'Escalation') {
+                draft = `Dear OnBuy Support,
+
+Re: Escalation - Order ${orderId}
+
+Thank you for bringing this escalation to our attention. We take all customer concerns seriously and are committed to resolving this matter promptly.
+
+[Add your response to the specific escalation]
+
+We appreciate your patience and understanding.
+
+Best regards,
+[Your Name]`;
+            } else {
+                draft = `Dear OnBuy Support,
+
+Re: Order ${orderId} / Dispute Ref: ${disputeRef}
+
+Thank you for notifying us about this ${String(d.type || 'dispute').toLowerCase()}. We are looking into this matter and will provide a full response shortly.
+
+[Add details here]
+
+Best regards,
+[Your Name]`;
+            }
+
+            $('ddReplyDraft').value = draft;
+        };
+
+        window.copyDisputeReply = function() {
+            const textarea = $('ddReplyDraft');
+            textarea.select();
+            document.execCommand('copy');
+            toast('Reply draft copied to clipboard!', 'success');
+        };
+
+        window.saveDisputeDetail = async function() {
+            if (!currentDisputeId) return;
+            const status = $('ddStatusSelect').value;
+            const notes = $('ddNotes').value;
+            const replyDraft = $('ddReplyDraft').value;
+
             try {
-                const upd = { status };
-                if (status === 'Resolved') { upd.resolvedAt = serverTimestamp(); }
-                await updateDoc(doc(db, "orderTracker_disputes", id), upd);
-                toast('Dispute status updated.', 'success');
+                const res = await fetch(`${API_BASE}/updateDisputeStatus?key=Katimatitati99@`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        disputeId: currentDisputeId,
+                        status,
+                        notes,
+                        replyDraft,
+                        resolvedBy: status === 'Resolved' ? roleLabel(currentRole) : undefined
+                    })
+                });
+                const data = await res.json();
+                if (!data.success) throw new Error(data.error);
+
+                toast('Dispute updated successfully!', 'success');
+                closeModal('disputeDetailModal');
+                loadDisputesFromApi();
+            } catch (e) {
+                // Fallback: update Firestore directly
+                try {
+                    const updates = { status, notes, replyDraft };
+                    if (status === 'Resolved') {
+                        updates.resolvedBy = roleLabel(currentRole);
+                        updates.resolvedAt = serverTimestamp();
+                    }
+                    await updateDoc(doc(db, "orderTracker_disputes", currentDisputeId), updates);
+                    toast('Dispute updated (direct).', 'success');
+                    closeModal('disputeDetailModal');
+                } catch (e2) {
+                    toast('Error saving: ' + e2.message, 'error');
+                }
+            }
+        };
+
+        window.sendDisputeReply = async function() {
+            if (!isAdmin()) return toast('Only Super Admin can send email replies.', 'error');
+            const replyBody = $('ddReplyDraft').value.trim();
+            if (!replyBody) return toast('Generate or write a reply draft first.', 'error');
+            if (!currentDisputeId) return;
+            try {
+                const res = await fetch(`${API_BASE}/sendDisputeReply?key=Katimatitati99@`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ disputeId: currentDisputeId, replyBody })
+                });
+                const data = await res.json();
+                if (!data.success) throw new Error(data.error);
+                toast('Reply sent via email!', 'success');
+                closeModal('disputeDetailModal');
+                loadDisputesFromApi();
+            } catch (e) {
+                toast('Send failed: ' + e.message, 'error');
+            }
+        };
+
+        window.quickResolveDispute = async function(id) {
+            const resolution = prompt('How was it resolved? (e.g. Full refund, replacement sent, found in buyer favour)');
+            if (resolution === null) return;
+            try {
+                await updateDoc(doc(db, "orderTracker_disputes", id), {
+                    status: 'Resolved', resolution,
+                    resolvedAt: serverTimestamp(), resolvedBy: roleLabel(currentRole)
+                });
+                toast('Dispute resolved. Nice work.', 'success');
+                loadDisputesFromApi();
             } catch (e) { toast('Update failed: ' + e.message, 'error'); }
         };
 
+        // Keep existing manual add + reply modal functions
         window.openAddDispute = function() {
             ['dOrderId', 'dRef', 'dDetails'].forEach(i => $(i).value = '');
             $('dDeadlineHours').value = 24;
@@ -2853,7 +3316,6 @@ async function saveSplitPercentages(){
                 toast('Dispute logged — countdown started.', 'success');
             } catch (e) { toast('Save failed: ' + e.message, 'error'); }
         };
-
         window.openReply = function(id) {
             const d = disputes.find(x => x.id === id);
             if (!d) return;
@@ -2893,8 +3355,7 @@ async function saveSplitPercentages(){
             } catch (e) { toast('Update failed: ' + e.message, 'error'); }
         };
         // Keep countdowns fresh
-        setInterval(() => { if (!document.hidden && disputes.length) renderDisputes(); }, 60000);
-
+        setInterval(() => { if (!document.hidden) loadDisputesFromApi(); }, 60000);
         /* ================= VA PERFORMANCE + DEAD LISTING BATCH ================= */
         const perfId = () => `${currentRole}_${todayStr()}`;
         async function bumpPerf(field, n = 1) {
@@ -3148,8 +3609,15 @@ async function saveSplitPercentages(){
             try {
                 await addDoc(collection(db, "orderTracker_clients"), {
                     name,
+                    team: $('cAccount').value,
                     onbuyEmail: $('cOnbuyEmail').value.trim(),
                     disputeEmail: $('cDisputeEmail').value.trim(),
+                    replyFromEmail: $('cReplyFromEmail').value.trim(),
+                    replyFromName: $('cReplyFromName').value.trim(),
+                    smtpHost: $('cSmtpHost').value.trim() || 'smtp.gmail.com',
+                    smtpPort: Number($('cSmtpPort').value) || 587,
+                    smtpUser: $('cSmtpUser').value.trim(),
+                    smtpPasswordEnvVar: $('cSmtpPasswordEnvVar').value.trim(),
                     listingsCount: Number($('cListings').value) || 0,
                     monthlyRevenue: Number($('cRevenue').value) || 0,
                     status: 'onboarding', stripeCustomerId: '', checklist: {},
