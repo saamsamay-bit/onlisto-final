@@ -1744,7 +1744,7 @@
                 : `Last 14 days · ${roleLabel(role)} only · actions in the batch are counted automatically`;
             renderOrders();
             calculatePNL();
-            renderDisputes();
+            renderDisputesV2(disputes);
             loadPerf();
             fetchCatalogHealth();   // chips, OOS pill & catalog stats follow the active role/account
             updateListingsHint();   // keep the "· X listings only" scope label in sync
@@ -3013,8 +3013,8 @@ Thank you for your patience, and apologies again for the trouble.`
                     });
                 }
                 if (status) filtered = filtered.filter(d => (d.status || 'Open') === status);
-                if (type) filtered = filtered.filter(d => (d.type || 'Other') === type);
-                if (urgency) filtered = filtered.filter(d => (d.urgency || 'Normal') === urgency);
+                if (type) filtered = filtered.filter(d => (d.reason || 'Other') === type);
+                if (urgency) filtered = filtered.filter(d => (d.priority || 'Normal') === urgency);
                 if (search) {
                     filtered = filtered.filter(d =>
                         (d.orderId || '').toLowerCase().includes(search) ||
@@ -3053,7 +3053,7 @@ Thank you for your patience, and apologies again for the trouble.`
 
         function renderDisputesV2(list) {
             const isActive = s => s !== 'Resolved' && s !== 'Closed' && s !== 'Ignored';
-            const urgent = list.filter(d => isActive(d.status || 'Open') && d.urgency === 'High').length;
+            const urgent = list.filter(d => isActive(d.status || 'Open') && d.priority === 'High').length;
             const open = list.filter(d => (d.status || 'Open') === 'Open').length;
             const resolved = list.filter(d => !isActive(d.status || 'Open')).length;
             const totalFees = list.filter(d => isActive(d.status || 'Open')).reduce((sum, d) => sum + (d.feeAmount || 0), 0);
@@ -3074,9 +3074,9 @@ Thank you for your patience, and apologies again for the trouble.`
             tbody.innerHTML = list.map(d => {
                 const date = d.receivedAt ? new Date(d.receivedAt).toLocaleDateString('en-GB') : '—';
                 const fee = d.feeAmount ? `£${d.feeAmount.toFixed(2)}` : '—';
-                const typeClass = getDisputeTypeClass(d.type);
-                const urgencyClass = getDisputeUrgencyClass(d.urgency);
-                const isUrgent = d.urgency === 'High';
+                const typeClass = getDisputeTypeClass(d.reason || 'Other');
+                const urgencyClass = getDisputeUrgencyClass(d.priority || d.priority || 'Normal');
+                const isUrgent = (d.priority || d.priority || 'Normal') === 'High';
                 const statusBadge = d.status === 'Open' ? 'badge-danger'
                     : d.status === 'Resolved' ? 'badge-success'
                     : d.status === 'In Progress' ? 'badge-warning'
@@ -3086,10 +3086,10 @@ Thank you for your patience, and apologies again for the trouble.`
                     <td class="small">${date}</td>
                     <td><strong class="mono">${esc(d.orderId || '—')}</strong></td>
                     <td class="small">${esc(d.disputeRef || '—')}</td>
-                    <td><span class="badge ${typeClass}">${esc(d.type || 'Other')}</span></td>
+                    <td><span class="badge ${typeClass}">${esc(d.reason || 'Other')}</span></td>
                     <td class="small" style="max-width:200px">${esc(d.reason || '—')}</td>
                     <td style="font-weight:800;color:var(--red)">${fee}</td>
-                    <td><span class="badge ${urgencyClass}">${esc(d.urgency || 'Normal')}</span></td>
+                    <td><span class="badge ${urgencyClass}">${esc(d.priority || d.priority || 'Normal')}</span></td>
                     <td><span class="badge ${statusBadge}">${esc(d.status || 'Open')}</span></td>
                     <td>
                         <button onclick="openDisputeDetail('${d.id}')" class="btn btn-primary btn-sm" style="margin-bottom:4px">View</button>
@@ -3123,17 +3123,17 @@ Thank you for your patience, and apologies again for the trouble.`
             currentDisputeId = id;
 
             $('ddTitle').textContent = `Dispute ${esc(d.disputeRef || d.orderId || 'Detail')}`;
-            $('ddSub').textContent = `From: ${esc(d.from || 'OnBuy Support')} · Type: ${esc(d.type || 'Other')}`;
+            $('ddSub').textContent = `From: ${esc(d.from || 'OnBuy Support')} · Type: ${esc(d.reason || 'Other')}`;
             $('ddOrderId').textContent = d.orderId || '—';
             $('ddDisputeRef').textContent = d.disputeRef || '—';
-            $('ddType').textContent = d.type || 'Other';
-            $('ddUrgency').textContent = d.urgency || 'Normal';
+            $('ddType').textContent = d.reason || 'Other';
+            $('ddUrgency').textContent = d.priority || d.priority || 'Normal';
             $('ddFee').textContent = d.feeAmount ? `£${d.feeAmount.toFixed(2)}` : '—';
             $('ddReceived').textContent = d.receivedAt ? new Date(d.receivedAt).toLocaleString('en-GB') : '—';
             $('ddSubject').textContent = d.subject || '—';
             $('ddReason').textContent = d.reason || '—';
             $('ddOutcome').textContent = d.outcome || '—';
-            $('ddRaw').textContent = d.rawText || 'No raw text saved.';
+            $('ddRaw').textContent = d.rawBody || d.rawBody || 'No raw text saved.';
             $('ddReplyDraft').value = d.replyDraft || '';
             $('ddNotes').value = d.notes || '';
             $('ddStatusSelect').value = d.status || 'Open';
@@ -3150,7 +3150,7 @@ Thank you for your patience, and apologies again for the trouble.`
             const disputeRef = d.disputeRef || 'N/A';
             let draft = '';
 
-            if (d.type === 'Chargeback' || d.type === 'Not Received') {
+            if (d.reason === 'Chargeback' || d.reason === 'Not Received') {
                 draft = `Dear OnBuy Support,
 
 Re: Order ${orderId} / Dispute Ref: ${disputeRef}
@@ -3180,7 +3180,7 @@ Best regards,
 Best regards,
 [Your Name]`;
                 }
-            } else if (d.type === 'Escalation') {
+            } else if (d.reason === 'Escalation') {
                 draft = `Dear OnBuy Support,
 
 Re: Escalation - Order ${orderId}
@@ -3198,7 +3198,7 @@ Best regards,
 
 Re: Order ${orderId} / Dispute Ref: ${disputeRef}
 
-Thank you for notifying us about this ${String(d.type || 'dispute').toLowerCase()}. We are looking into this matter and will provide a full response shortly.
+Thank you for notifying us about this ${String(d.reason || 'dispute').toLowerCase()}. We are looking into this matter and will provide a full response shortly.
 
 [Add details here]
 

@@ -1475,14 +1475,10 @@ function parseDisputeEmail(subject, text, html) {
 
   // Extract reason
   const reasonPatterns = [
-    /Reason\s*[:\s]+(.+?)(?:
-|$)/i,
-    /dispute reason[:\s]+(.+?)(?:
-|$)/i,
-    /customer claims[:\s]+(.+?)(?:
-|$)/i,
-    /issue[:\s]+(.+?)(?:
-|$)/i,
+    /Reason\s*[:\s]+(.+?)(?:\n|$)/i,
+    /dispute reason[:\s]+(.+?)(?:\n|$)/i,
+    /customer claims[:\s]+(.+?)(?:\n|$)/i,
+    /issue[:\s]+(.+?)(?:\n|$)/i,
   ];
   for (const p of reasonPatterns) {
     const m = body.match(p);
