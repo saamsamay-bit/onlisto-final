@@ -44,6 +44,12 @@
  *     AND receiveDisputeEmail (messageId, ref+orderId, and orderId-only dedup).
  * #12f CHARGEBACK PARSER (7 Aug 2026): refs must contain a digit and not be
  *     a template word — was saving disputeRef "URGENT" and orderId "number".
+ * #12g FALSE-CLOSE REPAIR (7 Aug 2026): v1 close-rule fired on "Resolution
+ *     Assistance" (= OnBuy asking the SELLER for help) and threat boilerplate
+ *     ("decision WILL BE final / MAY RESULT in a refund") — 5 false closes.
+ *     Now: veto list first, strong past-tense only; threat text never saved
+ *     as outcome; updateDisputeStatus can reopen (clears close stamp), edit
+ *     type/outcome, and hardDelete junk docs.
  * #13 BUYER PHONE (28 Jul 2026): the 23 Jul rebuild guessed
  *     delivery_address.phone â€” wrong/empty, WhatsApp+call buttons vanished
  *     from the orders table (they only render when buyerPhone exists).
@@ -1584,19 +1590,21 @@ function parseDisputeEmail(subject, text, html, messageId) {
     }
   }
 
-  // Extract OUTCOME
+  // Extract OUTCOME — #12g: future-tense threat patterns removed (they
+  // describe what OnBuy MIGHT do, not what it DID). Labelled extraction now
+  // requires a colon, and veto-listed candidates are discarded below.
   const outcomePatterns = [
-    /(?:outcome|decision|resolution)[:\s]+(.+?)(?=\n|\.(?:\s|$)|Thank you|Kind regards)/i,
+    /(?:outcome|decision|resolution)\s*:\s*(.+?)(?=\n|\.(?:\s|$)|Thank you|Kind regards)/i,
     /dispute is now closed as\s+(.+?)(?=\n|\.(?:\s|$)|Thank you|Kind regards)/i,
     /Refund was provided to the customer on\s+(.+?)(?=\n|\.(?:\s|$)|Thank you|Kind regards)/i,
-    /refund being issued to the buyer/i,
-    /we will issue a full refund to the customer/i,
-    /A decision made by our Customer Support team will be final and may result in a refund being issued to the buyer/i,
+    /refund has been issued to the buyer/i,
   ];
   for (const p of outcomePatterns) {
     const m = body.match(p);
     if (m) {
-      result.outcome = m[1] ? m[1].trim().replace(/\s+/g, ' ').slice(0, 300) : m[0].trim().replace(/\s+/g, ' ').slice(0, 300);
+      const cand = m[1] ? m[1].trim().replace(/\s+/g, ' ').slice(0, 300) : m[0].trim().replace(/\s+/g, ' ').slice(0, 300);
+      if (RESOLUTION_VETO.test(cand)) continue; // threat boilerplate, not an outcome
+      result.outcome = cand;
       break;
     }
   }
@@ -1653,10 +1661,19 @@ function findValidRef(text, patterns) {
 // closed" follow-ups; before this fix they vanished and every dispute
 // stayed Open forever (8/8 Open on the dashboard).
 // ---------------------------------------------------------------------------
+// #12g (7 Aug 2026): false-close fix. V1 closed disputes on the word
+// "Resolution" ("Resolution Assistance" = OnBuy asking the SELLER for help)
+// and on threat boilerplate ("a decision WILL BE final and MAY RESULT in a
+// refund") which appears in every OPENING escalation email. Now: veto list
+// first, then strong past-tense signals only.
+const RESOLUTION_VETO = /will be final|may result in|will issue|will be made|being issued|assistance|need your help|action required|respond by/i;
+const RESOLUTION_STRONG = /dispute\s+([A-Z0-9]{5,12}\s+)?(is\s+)?(now\s+)?closed|case\s+([A-Z0-9]{5,12}\s+)?(is\s+)?(now\s+)?closed|dispute\s+([A-Z0-9]{5,12}\s+)?(has\s+been\s+)?resolved|has\s+been\s+resolved|refund\s+was\s+provided|refund\s+has\s+been\s+issued|refund\s+issued|refund\s+completed|decision\s+has\s+been\s+made|closed\s+in\s+(your|the)\s+favo[u]?r/i;
 function isResolutionEmail(d, subject) {
   const s = String(subject || '');
-  if (/closed|resolved|resolution|refund (was )?provided|refund issued|decision|outcome|completed/i.test(s)) return true;
-  if (d.outcome) return true;
+  if (RESOLUTION_VETO.test(s)) return false;
+  if (RESOLUTION_STRONG.test(s)) return true;
+  const o = String(d.outcome || '');
+  if (o && !RESOLUTION_VETO.test(o) && RESOLUTION_STRONG.test(o)) return true;
   return false;
 }
 
@@ -1891,15 +1908,32 @@ exports.updateDisputeStatus = onRequest(
   async (req, res) => {
     if (!checkAdminKey(req, res)) return;
     try {
-      const { disputeId, status, notes, assignedTo, priority, replyDraft } = req.body || {};
+      const { disputeId, status, notes, assignedTo, priority, replyDraft, type, outcome, hardDelete } = req.body || {};
       if (!disputeId) return res.status(400).json({ error: 'Missing disputeId' });
 
+      // #12g: hard delete for junk docs left by the old parser bug
+      if (hardDelete === true) {
+        await db.collection('orderTracker_disputes').doc(disputeId).delete();
+        logger.info(`Dispute hard-deleted: ${disputeId}`);
+        return res.json({ success: true, deleted: disputeId });
+      }
+
       const updates = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
-      if (status !== undefined) updates.status = status;
+      if (status !== undefined) {
+        updates.status = status;
+        // #12g: reopening clears the auto-close stamp, or the dashboard
+        // keeps showing stale closedAt/closedBy forever.
+        if (status !== 'Closed') {
+          updates.closedAt = admin.firestore.FieldValue.delete();
+          updates.closedBy = admin.firestore.FieldValue.delete();
+        }
+      }
       if (notes !== undefined) updates.notes = notes;
       if (assignedTo !== undefined) updates.assignedTo = assignedTo;
       if (priority !== undefined) updates.priority = priority;
       if (replyDraft !== undefined) updates.replyDraft = replyDraft;
+      if (type !== undefined) updates.type = type;
+      if (outcome !== undefined) updates.outcome = outcome;
 
       await db.collection('orderTracker_disputes').doc(disputeId).update(updates);
       res.json({ success: true, disputeId, updates: Object.keys(updates) });
