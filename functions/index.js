@@ -1,12 +1,12 @@
 /**
  * ============================================================================
- * ONLISTO — MASTER index.js (single source of truth)
+ * ONLISTO â€” MASTER index.js (single source of truth)
  * ============================================================================
  * Rebuilt 23 Jul 2026 from: GitHub backup (40KB) + live Firebase function list
  * (21 functions) + dashboard HTML contract (onlisto.io).
  *
  * FIXES IN THIS FILE (mapped to the bug list):
- *  #1 node-fetch removed — Node 24 has fetch built in (was MODULE_NOT_FOUND)
+ *  #1 node-fetch removed â€” Node 24 has fetch built in (was MODULE_NOT_FOUND)
  *  #2 pullOnBuyOrders no longer calls undefined fetchOnBuyOrders; reads API
  *     keys from Firebase Secrets, not from a non-existent org doc field
  *  #3 ONE dedupe scheme everywhere: doc ID = onbuy_<orderId> for scheduler
@@ -20,12 +20,12 @@
  *  #7 checkSourcePrices / manualSourceCheck / updateListingSource now need
  *     ?key=ADMIN_KEY (was open to the whole internet burning Bee credits)
  *  #8 migrateData removed (open collection copier). Legacy one-time jobs
- *     intentionally NOT in this file — they get deleted on deploy.
- *  #9 /orders IGNORES page=N (24 Jul 2026) — import + dispatch-sync passes
+ *     intentionally NOT in this file â€” they get deleted on deploy.
+ *  #9 /orders IGNORES page=N (24 Jul 2026) â€” import + dispatch-sync passes
  *     now paginate with limit+offset like /listings.
  * #10 UNFILTERED /orders only returns AWAITING orders (24 Jul 2026, proven
  *     live: syncScanned == exact awaiting count). Dispatch-sync must query
- *     filter[status]=dispatched explicitly — this was the true root of the
+ *     filter[status]=dispatched explicitly â€” this was the true root of the
  *     ghost-orders bug (dispatched on OnBuy, stuck 'active' on dashboard).
  *     Cancelled orders now flag needsAttention for human review.
  * #11 SYNC EXTENSION (26 Jul 2026, probe-proven): sync also pulls
@@ -35,10 +35,17 @@
  *     'Refunded' one-way (statusSource: onbuy_sync). Feeds the dashboard's
  *     cancelled/refunded view + refund-rate KPI. NOTE: /disputes, /cases,
  *     /returns, /refunds endpoints do NOT exist for sellers (HTTP 403,
- *     probe-proven) — disputes stay on the email parser.
+ *     probe-proven) â€” disputes stay on the email parser.
  * #12 getLiveData heartbeat now includes the Refunded count + hasBuyerPhone.
+ * #12e RESOLUTION EMAILS (7 Aug 2026): duplicate emails now UPDATE the
+ *     dispute — resolution emails close it (status Closed), every email is
+ *     appended to emailHistory[], needsAttention set. Was: skip on duplicate,
+ *     so all 8 disputes stayed Open forever. Applies to scheduledImapReader
+ *     AND receiveDisputeEmail (messageId, ref+orderId, and orderId-only dedup).
+ * #12f CHARGEBACK PARSER (7 Aug 2026): refs must contain a digit and not be
+ *     a template word — was saving disputeRef "URGENT" and orderId "number".
  * #13 BUYER PHONE (28 Jul 2026): the 23 Jul rebuild guessed
- *     delivery_address.phone — wrong/empty, WhatsApp+call buttons vanished
+ *     delivery_address.phone â€” wrong/empty, WhatsApp+call buttons vanished
  *     from the orders table (they only render when buyerPhone exists).
  *     extractBuyerPhone() tries every candidate field in buyer AND
  *     delivery_address; import + both sync passes backfill buyerPhone when
@@ -130,8 +137,8 @@ async function getOnBuyToken(consumerKey, secretKey) {
 }
 
 // OnBuy quirk (PROVEN 23 Jul 2026 via testOnBuyAuth 4-way matrix):
-// API calls need the RAW token — a "Bearer " prefix gets HTTP 401.
-// Path is /orders?site_id=2000 — /sites/2000/orders gets HTTP 404.
+// API calls need the RAW token â€” a "Bearer " prefix gets HTTP 401.
+// Path is /orders?site_id=2000 â€” /sites/2000/orders gets HTTP 404.
 // Order lists come back in json.results (NOT json.data / json.orders).
 async function onbuyGet(token, path) {
   const res = await fetch(`${ONBUY_BASE}${path}`, {
@@ -156,7 +163,7 @@ function extractList(json, context) {
 function checkAdminKey(req, res) {
   const expected = process.env.ADMIN_KEY || '';
   if (!expected) {
-    res.status(503).json({ error: 'ADMIN_KEY is not set in functions/.env — add it and redeploy.' });
+    res.status(503).json({ error: 'ADMIN_KEY is not set in functions/.env â€” add it and redeploy.' });
     return false;
   }
   const got = req.query.key || req.get('x-admin-key') || (req.body && req.body.key) || '';
@@ -177,9 +184,9 @@ function orderDocId(onbuyOrderId) {
 }
 
 // Buyer phone (#13, 28 Jul 2026): the 23 Jul rebuild guessed
-// delivery_address.phone — real field name unconfirmed, so check EVERY
+// delivery_address.phone â€” real field name unconfirmed, so check EVERY
 // candidate in BOTH buyer and delivery_address. WhatsApp/call buttons on
-// the dashboard only render when buyerPhone exists — empty field = buttons
+// the dashboard only render when buyerPhone exists â€” empty field = buttons
 // vanish (user-reported).
 function extractBuyerPhone(o) {
   const addr = o.delivery_address || {};
@@ -193,7 +200,7 @@ function extractBuyerPhone(o) {
 }
 
 // ---------------------------------------------------------------------------
-// ORDERS — one shared import/sync path (scheduler + manual use the same code)
+// ORDERS â€” one shared import/sync path (scheduler + manual use the same code)
 // ---------------------------------------------------------------------------
 async function importOrSyncOrder(account, o) {
   const onbuyOrderId = String(o.order_id || o.id || o.order_number || '');
@@ -211,7 +218,7 @@ async function importOrSyncOrder(account, o) {
 
   if (snap.exists) {
     // Bug #5 fix: mirror OnBuy truth into onbuyStatus ONLY.
-    // Never touch `status` — that field belongs to the VA/dashboard workflow.
+    // Never touch `status` â€” that field belongs to the VA/dashboard workflow.
     const ex = snap.data();
     const updates = { lastSyncedAt: now };
     if ((ex.onbuyStatus || '') !== onbuyStatus) updates.onbuyStatus = onbuyStatus;
@@ -254,7 +261,7 @@ async function importOrSyncOrder(account, o) {
     qty: Number(item.quantity || o.quantity || 1),
     sellingPrice: Number(o.price_total ?? o.total ?? item.price ?? 0),      // real OnBuy field: price_total
     onbuyFee: Number(o.sales_fee_inc_VAT ?? o.sales_fee_ex_VAT ?? o.sales_fee ?? 0), // real OnBuy field
-    amount: 0,                    // sourcing cost — VA fills this in
+    amount: 0,                    // sourcing cost â€” VA fills this in
     sourceOrderNo: '',
     sourceLink: '',
     notes: '',
@@ -264,7 +271,7 @@ async function importOrSyncOrder(account, o) {
     buyerAddress: [addr.line_1, addr.town].filter(Boolean).join(', '),
     buyerPostcode: addr.postcode || '',
     onbuyOrderDate: (o.date || o.created || '').slice(0, 10), // real OnBuy field: date
-    status: 'active',             // VA workflow starts here — dashboard-owned
+    status: 'active',             // VA workflow starts here â€” dashboard-owned
     onbuyStatus,
     trackingNumber: '',
     trackingCarrier: '',
@@ -288,7 +295,7 @@ async function importOrSyncOrder(account, o) {
 // ONE-WAY dispatch sync: when OnBuy says an order is dispatched, the
 // dashboard follows (active -> Dispatched). NEVER backwards, never touches
 // any other VA-owned field. Primary signal: OnBuy's real `dispatched` bool.
-// Trap avoided: "Awaiting Dispatch" CONTAINS "dispatch" — exclude 'awaiting'.
+// Trap avoided: "Awaiting Dispatch" CONTAINS "dispatch" â€” exclude 'awaiting'.
 async function syncStatusFromOnBuy(account, o) {
   const onbuyOrderId = String(o.order_id || '');
   if (!onbuyOrderId) return 'skipped';
@@ -315,7 +322,7 @@ async function syncStatusFromOnBuy(account, o) {
   const ph = extractBuyerPhone(o);
   if (ph && !ex.buyerPhone) updates.buyerPhone = ph; // #13 backfill
 
-  // Sync extension (26 Jul 2026, pipeline #9/#11 data feed — probe-proven
+  // Sync extension (26 Jul 2026, pipeline #9/#11 data feed â€” probe-proven
   // fields): mirror OnBuy's raw money/workflow objects so the dashboard's
   // cancelled/refunded view + refund-rate KPI can read them from Firestore.
   const rawMirror = [['refunds', 'onbuyRefunds'], ['cancellation', 'onbuyCancellation'], ['dispatches', 'onbuyDispatches']];
@@ -327,13 +334,13 @@ async function syncStatusFromOnBuy(account, o) {
   }
 
   const currentStatus = String(ex.status || '');
-  // Cancelled on OnBuy → flag for a human, never auto-change status.
+  // Cancelled on OnBuy â†’ flag for a human, never auto-change status.
   if (s.includes('cancel') && currentStatus !== 'Cancelled' && !ex.needsAttention) {
     updates.needsAttention = true;
     updates.attentionReason = `OnBuy shows: ${onbuyStatus}`;
   }
 
-  // Refunded on OnBuy → dashboard follows (one-way, same rule as dispatch).
+  // Refunded on OnBuy â†’ dashboard follows (one-way, same rule as dispatch).
   if (s.includes('refund') && currentStatus !== 'Refunded' && currentStatus !== 'Cancelled') {
     updates.status = 'Refunded';
     updates.statusSource = 'onbuy_sync';
@@ -365,7 +372,7 @@ async function pullOrdersForAccount(account, fullRescan) {
   const exportedFilter = fullRescan ? '' : '&filter[previously_exported]=0';
   const counts = { imported: 0, synced: 0, unchanged: 0, skipped: 0, dispatchedSynced: 0 };
 
-  // OnBuy quirk #3 (PROVEN 24 Jul 2026): /orders IGNORES page=N — only
+  // OnBuy quirk #3 (PROVEN 24 Jul 2026): /orders IGNORES page=N â€” only
   // limit+offset paginate (same as /listings). Import loop keeps offset=0
   // because OnBuy marks orders exported on read, so each call returns the
   // next batch; full-rescan mode must paginate with real offsets instead.
@@ -387,14 +394,14 @@ async function pullOrdersForAccount(account, fullRescan) {
   }
 
   // Dispatch sync pass. OnBuy quirk #2 (proven 23 Jul 2026): "updated" is an
-  // INVALID sort field (HTTP 400) — "created" is the valid one. Wrapped so a
+  // INVALID sort field (HTTP 400) â€” "created" is the valid one. Wrapped so a
   // failure here can never swallow the import results above.
   try {
     // BUG FIX 24 Jul 2026 (two parts):
-    //  a) page=1&limit=100 — OnBuy ignores page=, only offset paginates.
+    //  a) page=1&limit=100 â€” OnBuy ignores page=, only offset paginates.
     //  b) UNFILTERED /orders only returns AWAITING orders (proven live:
     //     syncScanned equalled the exact awaiting count). Dispatched orders
-    //     NEVER appear there — must ask with filter[status]=dispatched.
+    //     NEVER appear there â€” must ask with filter[status]=dispatched.
     //     This was the true root of the 22-vs-12 ghost orders bug.
     let scanned = 0;
     for (let offset = 0; offset < 300; offset += 100) {
@@ -419,7 +426,7 @@ async function pullOrdersForAccount(account, fullRescan) {
       if (r === 'attention') counts.cancelFlagged = (counts.cancelFlagged || 0) + 1;
     }
 
-    // Refunded orders (26 Jul 2026 — probe-proven filter): dashboard follows
+    // Refunded orders (26 Jul 2026 â€” probe-proven filter): dashboard follows
     // one-way, refunds object mirrored by syncStatusFromOnBuy. Paginated.
     for (let offset = 0; offset < 300; offset += 100) {
       const refunded = await onbuyGet(token,
@@ -439,7 +446,7 @@ async function pullOrdersForAccount(account, fullRescan) {
   return counts;
 }
 
-// SCHEDULED — every 15 minutes, both accounts
+// SCHEDULED â€” every 15 minutes, both accounts
 exports.scheduledPullOnBuyOrders = onSchedule(
   { schedule: 'every 15 minutes', secrets: ALL_SECRETS, timeoutSeconds: 300, memory: '512MiB' },
   async () => {
@@ -454,7 +461,7 @@ exports.scheduledPullOnBuyOrders = onSchedule(
   }
 );
 
-// MANUAL — same code path, run from browser. ?key=...&account=panacea&full=1
+// MANUAL â€” same code path, run from browser. ?key=...&account=panacea&full=1
 exports.pullOnBuyOrders = onRequest(
   { secrets: ALL_SECRETS, timeoutSeconds: 540, memory: '1GiB' },
   async (req, res) => {
@@ -477,7 +484,7 @@ exports.pullOnBuyOrders = onRequest(
 );
 
 // ---------------------------------------------------------------------------
-// LISTINGS — Bug #6 fix: full pagination + change detection (saves money)
+// LISTINGS â€” Bug #6 fix: full pagination + change detection (saves money)
 // Runs hourly. Replaces both old pullOnBuyListings and pullOnBuyListingsHourly.
 // ---------------------------------------------------------------------------
 exports.pullOnBuyListings = onSchedule(
@@ -505,7 +512,7 @@ async function pullListingsForAccount(account) {
   // OnBuy quirk #3 (proven 24 Jul 2026 via listingsProbe): pagination is
   // offset/limit (metadata returns limit+offset+total_rows), NOT page=N.
   // Real fields: name (not product_title), stock, opc, condition, sale_price.
-  // winning_status / lead_listing_price DO NOT EXIST here — Buy Box data
+  // winning_status / lead_listing_price DO NOT EXIST here â€” Buy Box data
   // lives in OnBuy's CSV export or another endpoint (next-session probe).
   for (let offset = 0; offset < 30000; offset += 100) {
     const json = await onbuyGet(token, `/listings?site_id=2000&country_code=GB&limit=100&offset=${offset}`);
@@ -573,8 +580,8 @@ async function pullListingsForAccount(account) {
 }
 
 // ---------------------------------------------------------------------------
-// REPRICER — user decision 23 Jul 2026: KEEP LIVE (pushes real OnBuy prices).
-// Floor = (last logged cost × (1 + margin%)) ÷ (1 − real fee rate).
+// REPRICER â€” user decision 23 Jul 2026: KEEP LIVE (pushes real OnBuy prices).
+// Floor = (last logged cost Ã— (1 + margin%)) Ã· (1 âˆ’ real fee rate).
 // Never goes below floor; never touches SKUs with no logged cost.
 // ---------------------------------------------------------------------------
 const DEFAULT_MARGIN_PERCENT = 15;
@@ -685,14 +692,14 @@ exports.repriceToWinBuyBox = onSchedule(
         await batch.commit();
         logger.info(`${accountName}: repriced ${items.length} listing(s).`);
       } catch (e) {
-        logger.error(`${accountName}: reprice push failed — ${e.message}`);
+        logger.error(`${accountName}: reprice push failed â€” ${e.message}`);
       }
     }
   }
 );
 
 // ---------------------------------------------------------------------------
-// DISPATCH PUSH — VA adds tracking on dashboard → send it to OnBuy instantly
+// DISPATCH PUSH â€” VA adds tracking on dashboard â†’ send it to OnBuy instantly
 // ---------------------------------------------------------------------------
 exports.pushTrackingToOnBuy = onDocumentUpdated(
   { document: 'orderTracker_orders/{orderId}', secrets: ALL_SECRETS },
@@ -742,10 +749,10 @@ exports.pushTrackingToOnBuy = onDocumentUpdated(
 );
 
 // ---------------------------------------------------------------------------
-// FIX STALE ORDERS (rewritten — old source was lost)
+// FIX STALE ORDERS (rewritten â€” old source was lost)
 // Dry-run by default. Add &execute=true to actually write.
-// Usage: /fixStaleOrders?key=...&days=14            → shows what WOULD change
-//        /fixStaleOrders?key=...&days=14&execute=true → marks them Dispatched
+// Usage: /fixStaleOrders?key=...&days=14            â†’ shows what WOULD change
+//        /fixStaleOrders?key=...&days=14&execute=true â†’ marks them Dispatched
 // ---------------------------------------------------------------------------
 exports.fixStaleOrders = onRequest(
   { timeoutSeconds: 540, memory: '512MiB' },
@@ -774,7 +781,7 @@ exports.fixStaleOrders = onRequest(
         totalOldOrders: snap.size,
         staleCount: stale.length,
         sample: stale.slice(0, 20).map(d => ({ id: d.id, status: d.data().status, account: d.data().account })),
-        message: 'DRY RUN — add &execute=true to the URL to actually mark these as Dispatched.',
+        message: 'DRY RUN â€” add &execute=true to the URL to actually mark these as Dispatched.',
       });
     }
 
@@ -796,12 +803,12 @@ exports.fixStaleOrders = onRequest(
 );
 
 // ---------------------------------------------------------------------------
-// GET LIVE DATA (read-only) — the closed-loop debugging API.
+// GET LIVE DATA (read-only) â€” the closed-loop debugging API.
 // Lets an AI assistant read LIVE Firestore to compare what the CODE says
 // vs what the DATA actually shows. Own READONLY_KEY: can read, never write.
 // Buyer contact details (email/phone/address/postcode) are always stripped.
 //
-//   /getLiveData?key=...                          → system heartbeat (counts)
+//   /getLiveData?key=...                          â†’ system heartbeat (counts)
 //   /getLiveData?key=...&mode=collection&name=orderTracker_orders&limit=20
 // ---------------------------------------------------------------------------
 const READABLE = /^orderTracker_[a-zA-Z]+$/;
@@ -823,7 +830,7 @@ function serializeDoc(data) {
 exports.getLiveData = onRequest({ cors: true, timeoutSeconds: 120 }, async (req, res) => {
   const expected = process.env.READONLY_KEY || '';
   if (!expected) {
-    res.status(503).json({ error: 'READONLY_KEY is not set in functions/.env — add it and redeploy.' });
+    res.status(503).json({ error: 'READONLY_KEY is not set in functions/.env â€” add it and redeploy.' });
     return;
   }
   if ((req.query.key || '') !== expected) {
@@ -850,7 +857,7 @@ exports.getLiveData = onRequest({ cors: true, timeoutSeconds: 120 }, async (req,
       return;
     }
 
-    // default: overview heartbeat — cheap aggregation counts
+    // default: overview heartbeat â€” cheap aggregation counts
     const countOf = async (name, field, value) => {
       let q = db.collection(name);
       if (field !== undefined) q = q.where(field, '==', value);
@@ -913,10 +920,10 @@ exports.getLiveData = onRequest({ cors: true, timeoutSeconds: 120 }, async (req,
 });
 
 // ---------------------------------------------------------------------------
-// TEST ONBUY AUTH — one browser visit settles Bug #4 with evidence.
+// TEST ONBUY AUTH â€” one browser visit settles Bug #4 with evidence.
 // Usage: /testOnBuyAuth?key=...&account=panacea   (or samayy)
 // Returns which auth style worked + the real response shape of /orders.
-// No secrets are ever returned — only success/failure and field names.
+// No secrets are ever returned â€” only success/failure and field names.
 // ---------------------------------------------------------------------------
 exports.testOnBuyAuth = onRequest(
   { secrets: ALL_SECRETS, timeoutSeconds: 120 },
@@ -999,7 +1006,7 @@ exports.testOnBuyAuth = onRequest(
     }
 
     // Listings probe: raw Buy Box field truth (same evidence pattern that
-    // settled every orders question — no guessing, dump what OnBuy sends)
+    // settled every orders question â€” no guessing, dump what OnBuy sends)
     if (token) {
       try {
         const r = await fetch(`${ONBUY_BASE}/listings?site_id=2000&country_code=GB&page=1&limit=2`, {
@@ -1033,7 +1040,7 @@ exports.testOnBuyAuth = onRequest(
 );
 
 // ---------------------------------------------------------------------------
-// SCRAPINGBEE — price checking (key-protected now, Bug #7)
+// SCRAPINGBEE â€” price checking (key-protected now, Bug #7)
 // ---------------------------------------------------------------------------
 const buildScrapingBeeUrl = (targetUrl) => {
   const apiKey = getScrapingBeeKey();
@@ -1049,7 +1056,7 @@ const extractPrices = (html, platform) => {
   $(selector).each((i, el) => {
     if (i >= 3) return;
     const text = $(el).text().trim();
-    const match = text.match(/£?\s*([\d,]+\.?\d{0,2})/);
+    const match = text.match(/Â£?\s*([\d,]+\.?\d{0,2})/);
     if (match) {
       const price = parseFloat(match[1].replace(/,/g, ''));
       if (price > 0 && price < 10000) {
@@ -1073,11 +1080,11 @@ function extractSinglePrice(html, url) {
 
   const pricePatterns = [
     /class="a-price-whole"[^>]*>([\d,]+)/,
-    /class="a-offscreen"[^>]*>£?([\d,.]+)/,
+    /class="a-offscreen"[^>]*>Â£?([\d,.]+)/,
     /"priceAmount":\s*([\d.]+)/,
-    /"price":"£?([\d,.]+)"/,
+    /"price":"Â£?([\d,.]+)"/,
     /data-price="([\d,.]+)"/,
-    /£([\d,.]+)/,
+    /Â£([\d,.]+)/,
   ];
   for (const pattern of pricePatterns) {
     const match = html.match(pattern);
@@ -1179,7 +1186,7 @@ exports.checkSourcePrices = onRequest({ cors: true, timeoutSeconds: 120 }, async
   }
 });
 
-// VA manual entry — zero Bee cost.
+// VA manual entry â€” zero Bee cost.
 exports.manualSourceCheck = onRequest({ cors: true }, async (req, res) => {
   if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
   if (!checkAdminKey(req, res)) return;
@@ -1214,7 +1221,7 @@ exports.manualSourceCheck = onRequest({ cors: true }, async (req, res) => {
   }
 });
 
-// VA adds/updates a listing's source URL — scheduled checker picks it up.
+// VA adds/updates a listing's source URL â€” scheduled checker picks it up.
 exports.updateListingSource = onRequest({ cors: true }, async (req, res) => {
   if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
   if (!checkAdminKey(req, res)) return;
@@ -1246,9 +1253,9 @@ exports.updateListingSource = onRequest({ cors: true }, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// TIER SYSTEM — hot listings checked often, dead ones rarely (saves Bee money)
-// A: 6h · B: 24h · C: 72h · D: 168h (1 week)
-// Price change → move UP a tier. No change → drift DOWN after threshold.
+// TIER SYSTEM â€” hot listings checked often, dead ones rarely (saves Bee money)
+// A: 6h Â· B: 24h Â· C: 72h Â· D: 168h (1 week)
+// Price change â†’ move UP a tier. No change â†’ drift DOWN after threshold.
 // ---------------------------------------------------------------------------
 const TIER_HOURS = { A: 6, B: 24, C: 72, D: 168 };
 const TIER_THRESHOLDS = { B_to_C: 5, C_to_D: 10 };
@@ -1288,8 +1295,8 @@ function updateTier(listing, newPrice) {
   return { newTier, consecutiveNoChange, lastPriceChange, priceChanged };
 }
 
-// SCHEDULED — hourly. 1 Bee call per due listing. History only on price change
-// (keeps docs small — old version logged every check forever).
+// SCHEDULED â€” hourly. 1 Bee call per due listing. History only on price change
+// (keeps docs small â€” old version logged every check forever).
 exports.scheduledCheckSourcePrices = onSchedule(
   { schedule: 'every 60 minutes', timeoutSeconds: 540, memory: '1GiB' },
   async () => {
@@ -1330,7 +1337,7 @@ exports.scheduledCheckSourcePrices = onSchedule(
               consecutiveNoChange: t.consecutiveNoChange,
               lastPriceChange: t.lastPriceChange,
             };
-            // History entries ONLY when the price moved — bounded doc growth.
+            // History entries ONLY when the price moved â€” bounded doc growth.
             if (t.priceChanged) {
               update.priceHistory = admin.firestore.FieldValue.arrayUnion({
                 price: extracted.price,
@@ -1341,7 +1348,7 @@ exports.scheduledCheckSourcePrices = onSchedule(
             }
             await db.collection('orderTracker_listings').doc(listing._docId).update(update);
             checked++;
-            logger.info(`${listing._docId}: £${extracted.price} (Tier ${t.newTier})`);
+            logger.info(`${listing._docId}: Â£${extracted.price} (Tier ${t.newTier})`);
           } catch (err) {
             logger.error(`Check failed ${listing._docId}: ${err.message}`);
           }
@@ -1355,17 +1362,17 @@ exports.scheduledCheckSourcePrices = onSchedule(
 );
 
 // ---------------------------------------------------------------------------
-// PROBE ONBUY DATA (pipeline #10, 25 Jul 2026) — evidence dump, no guessing.
+// PROBE ONBUY DATA (pipeline #10, 25 Jul 2026) â€” evidence dump, no guessing.
 // Answers: does the API expose disputes? refunds? what does a FULL single
 // order contain (all fields)? what do cancelled/dispatched orders carry?
 //   /probeOnBuyData?key=...&account=samayy&orderId=T6MD55X
-// Read-only. Returns field names + tiny samples — never secrets, never PII.
+// Read-only. Returns field names + tiny samples â€” never secrets, never PII.
 // RESULT (26 Jul 2026): /disputes /cases /returns /refunds = HTTP 403 (do NOT
-// exist for sellers — disputes stay on the email parser). filter[status]=
+// exist for sellers â€” disputes stay on the email parser). filter[status]=
 // refunded + cancelled both WORK; orders carry refunds/cancellation/
 // dispatches objects (now mirrored by the sync extension, fix #11).
 // #13 (28 Jul 2026): singleOrder also dumps buyer/delivery_address inner KEY
-// NAMES + phone-ish field paths — names only, never values.
+// NAMES + phone-ish field paths â€” names only, never values.
 // ---------------------------------------------------------------------------
 exports.probeOnBuyData = onRequest(
   { secrets: ALL_SECRETS, timeoutSeconds: 120 },
@@ -1394,7 +1401,7 @@ exports.probeOnBuyData = onRequest(
         // For single-order probe: dump the whole order minus buyer PII
         if (name === 'singleOrder' && r.ok) {
           const o = j.order || (Array.isArray(list) && list[0]) || j;
-          // #13: key NAMES only — which field really holds the phone?
+          // #13: key NAMES only â€” which field really holds the phone?
           report.probes[name].buyerKeys = o.buyer ? Object.keys(o.buyer) : [];
           report.probes[name].deliveryAddressKeys = o.delivery_address ? Object.keys(o.delivery_address) : [];
           const phonePaths = [];
@@ -1419,7 +1426,7 @@ exports.probeOnBuyData = onRequest(
       }
     };
 
-    // Candidate endpoints — OnBuy docs are a Postman collection; status codes tell the truth.
+    // Candidate endpoints â€” OnBuy docs are a Postman collection; status codes tell the truth.
     await probe('refundedOrders', '/orders?site_id=2000&filter[status]=refunded&limit=2&offset=0');
     await probe('cancelledOrders', '/orders?site_id=2000&filter[status]=cancelled&sort[created]=desc&limit=2&offset=0');
     await probe('dispatchedOrders', '/orders?site_id=2000&filter[status]=dispatched&sort[created]=desc&limit=1&offset=0');
@@ -1436,9 +1443,9 @@ exports.probeOnBuyData = onRequest(
 );
 
 // ============================================================================
-// INTENTIONALLY REMOVED (legacy — Firebase will offer to delete these, type Y):
+// INTENTIONALLY REMOVED (legacy â€” Firebase will offer to delete these, type Y):
 //   migrateAll, migrateOrders, migrateListings (v1, one-time, already ran)
-//   migrateData (open collection copier — security risk)
+//   migrateData (open collection copier â€” security risk)
 //   cleanupDuplicates (one-time, already ran 21 Jul)
 //   testScrapingBee (debug tool, no longer needed)
 //   getLiveDataV2 (reborn as the read-only getLiveData API above)
@@ -1446,48 +1453,152 @@ exports.probeOnBuyData = onRequest(
 //   pullOnBuyListingsHourly (replaced by paginated pullOnBuyListings above)
 
 // ============================================================================
-// DISPUTE EMAIL PARSER — receives forwarded OnBuy dispute emails
+// DISPUTE EMAIL PARSER â€” receives forwarded OnBuy dispute emails
 // ============================================================================
 
 // Helper: parse OnBuy dispute email body into structured data
-function parseDisputeEmail(subject, text, html) {
+function parseDisputeEmail(subject, text, html, messageId) {
   const body = text || html || '';
   const result = {
     disputeRef: '',
     orderId: '',
+    type: '',
     reason: '',
+    outcome: '',
     deadline: '',
     status: 'Open',
     receivedAt: new Date().toISOString(),
     rawSubject: subject || '',
-    rawBody: body.slice(0, 5000),
+    rawBody: body.slice(0, 8000),
+    messageId: messageId || '',
   };
 
-  // Extract dispute reference (e.g., T6K27YN, T6KQVBS)
-  const refMatch = subject.match(/([A-Z0-9]{6,8})/) || body.match(/Reference[:\s#]+([A-Z0-9]{6,8})/i);
-  if (refMatch) result.disputeRef = refMatch[1];
+  // Extract dispute reference — #12f: labelled patterns in the body first,
+  // then any ref-shaped token in the subject. Every candidate validated.
+  result.disputeRef = findValidRef(body, [
+    /Reference[:\s#]+([A-Za-z0-9]{6,10})/i,
+    /dispute\s*ref[:\s#]+([A-Za-z0-9]{6,10})/i,
+    /\bref[:\s#]+([A-Za-z0-9]{6,10})/i,
+  ]) || findValidRef(subject, [/([A-Za-z0-9]{6,8})/]);
 
-  // Extract order ID (OnBuy order numbers like T6K27YN or numeric)
-  const orderMatch = body.match(/Order\s*#?\s*[:\s]+([A-Z0-9]{6,10})/i) ||
-                     body.match(/order[_\s]id[:\s]+([A-Z0-9]{6,10})/i) ||
-                     subject.match(/([A-Z0-9]{6,8})/);
-  if (orderMatch) result.orderId = orderMatch[1];
+  // Extract order ID — try multiple patterns
+  // #12f: most-specific patterns FIRST (the old generic /Order\s*#?\s*/
+  // grabbed the word "number" out of "Order number: T6MQ6NM"). findValidRef
+  // rejects template words and keeps scanning the rest of the match list.
+  const orderPatterns = [
+    /order\s+number[:\s#]+([A-Za-z0-9]{6,10})/i,
+    /order[_\s]id[:\s#]+([A-Za-z0-9]{6,10})/i,
+    /order\s+ref[:\s#]+([A-Za-z0-9]{6,10})/i,
+    /your OnBuy order\s+([A-Za-z0-9]{6,10})/i,
+    /OnBuy order\s+([A-Za-z0-9]{6,10})/i,
+    /Order\s*#\s*([A-Za-z0-9]{6,10})/,
+    /Order[:\s]+([A-Za-z0-9]{6,10})/,
+  ];
+  result.orderId = findValidRef(body, orderPatterns)
+                || findValidRef(subject, [/Order[:\s]+([A-Za-z0-9]{6,10})/])
+                || findValidRef(subject, [/([A-Za-z0-9]{6,8})/]);
 
-  // Extract reason
+  // Extract TYPE from subject first
+  const subjectTypePatterns = [
+    /Customer\s+Escalation/i,
+    /Chargeback/i,
+    /Refund/i,
+    /Return/i,
+    /Dispute/i,
+    /Not\s+Received/i,
+    /Not\s+As\s+Described/i,
+    /Damaged/i,
+    /Wrong\s+Item/i,
+  ];
+  let typeFound = false;
+  for (const p of subjectTypePatterns) {
+    const m = subject.match(p);
+    if (m) {
+      let t = m[0].replace(/Customer\s+/i, '').trim();
+      result.type = t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
+      typeFound = true;
+      break;
+    }
+  }
+
+  if (!typeFound) {
+    const bodyTypePatterns = [
+      /type\s*[:\s]+(escalation|chargeback|refund|return|dispute|not received|not as described|damaged|wrong item)/i,
+      /issue\s*type\s*[:\s]+(escalation|chargeback|refund|return|dispute|not received|not as described|damaged|wrong item)/i,
+    ];
+    for (const p of bodyTypePatterns) {
+      const m = body.match(p);
+      if (m) {
+        result.type = m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+        typeFound = true;
+        break;
+      }
+    }
+  }
+
+  if (!typeFound) {
+    if (/escalation/i.test(body)) result.type = 'Escalation';
+    else if (/chargeback/i.test(body)) result.type = 'Chargeback';
+    else if (/refund\s*(was\s*provided|issued|being\s*issued|to\s*the\s*customer)/i.test(body)) result.type = 'Refund';
+    else if (/return/i.test(body)) result.type = 'Return';
+    else if (/not\s*received/i.test(body)) result.type = 'Not Received';
+    else if (/not\s*as\s*described|faulty|damaged/i.test(body)) result.type = 'Not As Described';
+    else if (/wrong\s*item/i.test(body)) result.type = 'Wrong Item';
+    else result.type = 'Other';
+  }
+
+  // Extract REASON — look for explicit reason field, then buyer complaint
   const reasonPatterns = [
-    /Reason\s*[:\s]+(.+?)(?:\n|$)/i,
-    /dispute reason[:\s]+(.+?)(?:\n|$)/i,
-    /customer claims[:\s]+(.+?)(?:\n|$)/i,
-    /issue[:\s]+(.+?)(?:\n|$)/i,
+    /(?:Reason|Issue|Complaint|Problem)[:\s]+(.+?)(?=\n|\.(?:\s|$)|Our team|Thank you|Kind regards|If you|Please)/i,
+    /The buyer has advised that\s+(.+?)(?=\n|\.(?:\s|$)|Our team|Thank you|Kind regards|If you|Please)/i,
+    /customer claims?[:\s]+(.+?)(?=\n|\.(?:\s|$)|Our team|Thank you|Kind regards|If you|Please)/i,
+    /buyer states that\s+(.+?)(?=\n|\.(?:\s|$)|Our team|Thank you|Kind regards|If you|Please)/i,
+    /buyer has reported that\s+(.+?)(?=\n|\.(?:\s|$)|Our team|Thank you|Kind regards|If you|Please)/i,
+    /regarding your order.*?[:\s]+(.+?)(?=\n|\.(?:\s|$)|Our team|Thank you|Kind regards|If you|Please)/i,
   ];
   for (const p of reasonPatterns) {
     const m = body.match(p);
-    if (m) { result.reason = m[1].trim(); break; }
+    if (m) {
+      const candidate = m[1].trim().replace(/\s+/g, ' ').slice(0, 300);
+      // Reject pure boilerplate
+      const boilerplate = /^\s*(?:refund to the customer|decision made by|we will issue|full refund|contact us|reply to this)\s*$/i;
+      if (!boilerplate.test(candidate)) { result.reason = candidate; break; }
+    }
   }
+
+  // If still no reason, use the first meaningful sentence after the order ID
   if (!result.reason) {
-    // fallback: first sentence after "dispute" or "claim"
-    const fb = body.match(/dispute.{0,200}/i) || body.match(/claim.{0,200}/i);
-    if (fb) result.reason = fb[0].replace(/\s+/g, ' ').trim().slice(0, 200);
+    const meaningful = body.match(/(?:order|dispute|issue|concern)[:\s]+[A-Z0-9]{6,10}[.\s]+(.+?)(?=\n|Thank you|Kind regards|Our team|If you|Please)/i);
+    if (meaningful) {
+      const candidate = meaningful[1].trim().replace(/\s+/g, ' ').slice(0, 300);
+      const boilerplate = /^\s*(?:refund to the customer|decision made by|we will issue|full refund|contact us|reply to this)\s*$/i;
+      if (!boilerplate.test(candidate)) result.reason = candidate;
+    }
+  }
+
+  // If still no reason, look for any sentence containing "buyer" + complaint verb
+  if (!result.reason) {
+    const buyerComplaint = body.match(/buyer\s+(?:has\s+)?(?:advised|reported|claimed|said|states|complained)\s+(?:that\s+)?(.+?)(?=\n|\.(?:\s|$)|Our team|Thank you|Kind regards)/i);
+    if (buyerComplaint) {
+      result.reason = buyerComplaint[1].trim().replace(/\s+/g, ' ').slice(0, 300);
+    }
+  }
+
+  // Extract OUTCOME
+  const outcomePatterns = [
+    /(?:outcome|decision|resolution)[:\s]+(.+?)(?=\n|\.(?:\s|$)|Thank you|Kind regards)/i,
+    /dispute is now closed as\s+(.+?)(?=\n|\.(?:\s|$)|Thank you|Kind regards)/i,
+    /Refund was provided to the customer on\s+(.+?)(?=\n|\.(?:\s|$)|Thank you|Kind regards)/i,
+    /refund being issued to the buyer/i,
+    /we will issue a full refund to the customer/i,
+    /A decision made by our Customer Support team will be final and may result in a refund being issued to the buyer/i,
+  ];
+  for (const p of outcomePatterns) {
+    const m = body.match(p);
+    if (m) {
+      result.outcome = m[1] ? m[1].trim().replace(/\s+/g, ' ').slice(0, 300) : m[0].trim().replace(/\s+/g, ' ').slice(0, 300);
+      break;
+    }
   }
 
   // Extract deadline
@@ -1496,6 +1607,7 @@ function parseDisputeEmail(subject, text, html) {
     /deadline[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
     /by[:\s]+(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})/i,
     /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}).{0,30}deadline/i,
+    /(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})/i,
   ];
   for (const p of deadlinePatterns) {
     const m = body.match(p);
@@ -1505,13 +1617,133 @@ function parseDisputeEmail(subject, text, html) {
   return result;
 }
 
+// #12f (7 Aug 2026): chargeback emails produced disputeRef "URGENT" and
+// orderId "number" — the extraction regexes grabbed TEMPLATE WORDS because
+// /i made [A-Z0-9] match lowercase dictionary words. Every candidate must
+// now look like a real OnBuy reference: alnum, CONTAINS A DIGIT, and not a
+// known template word.
+const REF_STOPWORDS = new Set(['URGENT', 'NUMBER', 'DISPUTE', 'CHARGEBACK', 'ORDER', 'ACTION',
+  'REQUIRED', 'RESPONSE', 'REFUND', 'RETURN', 'CLOSED', 'OPENED', 'UPDATE', 'ESCALATION',
+  'CASEID', 'TICKET', 'SUPPORT', 'CUSTOM', 'REVIEW', 'NOTICE', 'SELLER']);
+function looksLikeOnBuyRef(s) {
+  const v = String(s || '').toUpperCase();
+  if (v.length < 6 || v.length > 10) return false;
+  if (!/^[A-Z0-9]+$/.test(v)) return false;
+  if (!/\d/.test(v)) return false; // real OnBuy refs always contain a digit
+  if (REF_STOPWORDS.has(v)) return false;
+  return true;
+}
+function findValidRef(text, patterns) {
+  const t = String(text || '');
+  for (const p of patterns) {
+    const flags = p.flags.includes('g') ? p.flags : p.flags + 'g';
+    const re = new RegExp(p.source, flags);
+    let m;
+    while ((m = re.exec(t)) !== null) {
+      if (looksLikeOnBuyRef(m[1])) return m[1].toUpperCase();
+      if (m.index === re.lastIndex) re.lastIndex++;
+    }
+  }
+  return '';
+}
+
+// ---------------------------------------------------------------------------
+// #12e (7 Aug 2026): resolution emails must UPDATE the existing dispute,
+// not be skipped as duplicates. OnBuy sends "refund provided / dispute
+// closed" follow-ups; before this fix they vanished and every dispute
+// stayed Open forever (8/8 Open on the dashboard).
+// ---------------------------------------------------------------------------
+function isResolutionEmail(d, subject) {
+  const s = String(subject || '');
+  if (/closed|resolved|resolution|refund (was )?provided|refund issued|decision|outcome|completed/i.test(s)) return true;
+  if (d.outcome) return true;
+  return false;
+}
+
+// Returns 'closed' | 'updated' | 'already-recorded'.
+async function applyEmailToExistingDispute(docSnap, d, subject) {
+  const ex = docSnap.data();
+  const mid = d.messageId || '';
+  const hist = Array.isArray(ex.emailHistory) ? ex.emailHistory : [];
+  if (mid && hist.some(h => h && h.messageId === mid)) return 'already-recorded';
+
+  const entry = {
+    receivedAt: new Date().toISOString(),
+    subject: subject || '',
+    messageId: mid,
+    type: d.type || '',
+    outcome: d.outcome || '',
+  };
+  const updates = {
+    emailHistory: admin.firestore.FieldValue.arrayUnion(entry),
+    lastEmailAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    needsAttention: true,
+  };
+  // Fill gaps on older docs, never overwrite good data with blanks.
+  if (!ex.type && d.type) updates.type = d.type;
+  if (!ex.outcome && d.outcome) updates.outcome = d.outcome;
+  if (!ex.rawBody && d.rawBody) { updates.rawBody = d.rawBody; updates.rawSubject = subject || ''; }
+  // A resolution email closes an Open dispute (one-way — a human can reopen).
+  if (isResolutionEmail(d, subject) && String(ex.status || 'Open') === 'Open') {
+    updates.status = 'Closed';
+    updates.closedAt = admin.firestore.FieldValue.serverTimestamp();
+    updates.closedBy = 'email_pipeline';
+    if (d.outcome) updates.outcome = d.outcome;
+  }
+  await docSnap.ref.update(updates);
+  return updates.status === 'Closed' ? 'closed' : 'updated';
+}
+
 // HTTP endpoint: receive dispute email (SendGrid Inbound Parse or direct POST)
 exports.receiveDisputeEmail = onRequest(
   { cors: true, timeoutSeconds: 60, memory: '256MiB' },
   async (req, res) => {
     try {
-      const { subject, text, html, from, to } = req.body || {};
-      const parsed = parseDisputeEmail(subject, text, html);
+      const { subject, text, html, from, to, messageId } = req.body || {};
+      const parsed = parseDisputeEmail(subject, text, html, messageId);
+
+      // Dedup by messageId — #12e: UPDATE instead of skipping (resolution
+      // emails close the dispute + append to emailHistory).
+      if (parsed.messageId) {
+        const existing = await db.collection('orderTracker_disputes')
+          .where('messageId', '==', parsed.messageId).limit(1).get();
+        if (!existing.empty) {
+          const r = await applyEmailToExistingDispute(existing.docs[0], parsed, subject);
+          logger.info(`Dispute known message ${parsed.messageId} -> ${existing.docs[0].id} ${r}`);
+          return res.json({ success: true, duplicate: true, action: r, disputeId: existing.docs[0].id });
+        }
+      }
+
+      // Secondary dedup: same dispute, NEW email (the resolution-email case)
+      if (parsed.disputeRef && parsed.orderId) {
+        const existing2 = await db.collection('orderTracker_disputes')
+          .where('disputeRef', '==', parsed.disputeRef)
+          .where('orderId', '==', parsed.orderId)
+          .limit(1).get();
+        if (!existing2.empty) {
+          const r = await applyEmailToExistingDispute(existing2.docs[0], parsed, subject);
+          logger.info(`Dispute known ref ${parsed.disputeRef} / ${parsed.orderId} -> ${r}`);
+          return res.json({ success: true, duplicate: true, action: r, disputeId: existing2.docs[0].id });
+        }
+      }
+
+      // Tertiary dedup: orderId only (ref-less chargeback follow-ups)
+      if (!parsed.disputeRef && parsed.orderId) {
+        const existing3 = await db.collection('orderTracker_disputes')
+          .where('orderId', '==', parsed.orderId)
+          .limit(1).get();
+        if (!existing3.empty) {
+          const r = await applyEmailToExistingDispute(existing3.docs[0], parsed, subject);
+          logger.info(`Dispute known order ${parsed.orderId} (no ref) -> ${r}`);
+          return res.json({ success: true, duplicate: true, action: r, disputeId: existing3.docs[0].id });
+        }
+      }
+      // #12f: refuse junk docs with no usable reference at all
+      if (!parsed.disputeRef && !parsed.orderId) {
+        logger.warn(`receiveDisputeEmail: unparsable email (no ref/orderId). Subject: ${subject || ''}`);
+        return res.json({ success: false, error: 'Could not extract dispute reference or order ID — not saved.', rawSubject: subject || '' });
+      }
 
       // Determine which client/account this belongs to
       let team = '';
@@ -1549,13 +1781,23 @@ exports.receiveDisputeEmail = onRequest(
         disputeRef: parsed.disputeRef,
         orderId: parsed.orderId,
         orderDocId: orderDoc ? orderDoc.id : '',
+        type: parsed.type || '',
         reason: parsed.reason,
+        outcome: parsed.outcome || '',
         deadline: parsed.deadline,
         status: 'Open',
         priority: 'medium',
         receivedAt: admin.firestore.FieldValue.serverTimestamp(),
         rawSubject: parsed.rawSubject,
         rawBody: parsed.rawBody,
+        messageId: parsed.messageId || '',
+        emailHistory: [{
+          receivedAt: new Date().toISOString(),
+          subject: subject || '',
+          messageId: parsed.messageId || '',
+          type: parsed.type || '',
+          outcome: parsed.outcome || '',
+        }],
         replyDraft: '',
         replySent: false,
         replySentAt: null,
@@ -1618,7 +1860,9 @@ exports.getDisputes = onRequest(
           orderId: data.orderId || '',
           team: data.team || '',
           account: data.account || '',
+          type: data.type || '',
           reason: data.reason || '',
+          outcome: data.outcome || '',
           status: data.status || 'Open',
           priority: data.priority || 'medium',
           deadline: data.deadline || '',
@@ -1626,6 +1870,11 @@ exports.getDisputes = onRequest(
           replySent: !!data.replySent,
           assignedTo: data.assignedTo || '',
           notes: data.notes || '',
+          rawBody: data.rawBody || '',
+          rawSubject: data.rawSubject || '',
+          messageId: data.messageId || '',
+          needsAttention: !!data.needsAttention,
+          emailHistory: (Array.isArray(data.emailHistory) ? data.emailHistory : []).slice(-10),
         };
       });
       res.json({ success: true, count: docs.length, disputes: docs });
@@ -1662,7 +1911,7 @@ exports.updateDisputeStatus = onRequest(
 );
 
 // ============================================================================
-// IMAP DISPUTE READER — polls dispute@onlisto.io every 15 min
+// IMAP DISPUTE READER â€” polls dispute@onlisto.io every 15 min
 // ============================================================================
 
 function openImapBox(imap, boxName) {
@@ -1721,8 +1970,12 @@ async function readDisputeEmailsViaImap() {
 
   try {
     await openImapBox(imap, 'INBOX');
-    // Search UNSEEN emails from OnBuy support
-    const results = await searchImap(imap, [['UNSEEN'], ['FROM', 'customersupport-gb@onbuy.com']]);
+    // Search emails from OnBuy support received in last 7 days (catches SEEN too)
+    const sinceDate = new Date();
+    sinceDate.setDate(sinceDate.getDate() - 7);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const sinceStr = `${String(sinceDate.getDate()).padStart(2,'0')}-${months[sinceDate.getMonth()]}-${sinceDate.getFullYear()}`;
+    const results = await searchImap(imap, [['SINCE', sinceStr], ['FROM', 'customersupport-gb@onbuy.com']]);
     logger.info(`IMAP: ${results.length} unseen OnBuy dispute emails found`);
 
     if (!results.length) {
@@ -1732,11 +1985,59 @@ async function readDisputeEmailsViaImap() {
 
     const msgs = await fetchImapMessages(imap, results, { bodies: '', markSeen: true });
     let processed = 0;
+    let updatedCount = 0;
+    let skippedUnparsable = 0;
 
     for (const buf of msgs) {
       try {
         const parsed = await simpleParser(buf);
-        const disputeData = parseDisputeEmail(parsed.subject, parsed.text, parsed.html);
+        const disputeData = parseDisputeEmail(parsed.subject, parsed.text, parsed.html, parsed.messageId);
+
+        // Dedup by messageId — #12e: UPDATE the existing dispute (resolution
+        // emails close it + append emailHistory) instead of skipping.
+        if (disputeData.messageId) {
+          const existing = await db.collection('orderTracker_disputes')
+            .where('messageId', '==', disputeData.messageId).limit(1).get();
+          if (!existing.empty) {
+            const r = await applyEmailToExistingDispute(existing.docs[0], disputeData, parsed.subject);
+            if (r !== 'already-recorded') updatedCount++;
+            logger.info(`IMAP: known message ${disputeData.messageId} -> ${existing.docs[0].id} ${r}`);
+            continue;
+          }
+        }
+        // Secondary dedup: same dispute, NEW email (the resolution-email case)
+        if (disputeData.disputeRef && disputeData.orderId) {
+          const existing2 = await db.collection('orderTracker_disputes')
+            .where('disputeRef', '==', disputeData.disputeRef)
+            .where('orderId', '==', disputeData.orderId)
+            .limit(1).get();
+          if (!existing2.empty) {
+            const r = await applyEmailToExistingDispute(existing2.docs[0], disputeData, parsed.subject);
+            if (r !== 'already-recorded') updatedCount++;
+            logger.info(`IMAP: known dispute ${disputeData.disputeRef} / ${disputeData.orderId} -> ${r}`);
+            continue;
+          }
+        }
+        // Tertiary dedup: orderId only (chargeback emails often carry no
+        // dispute ref — without this, every follow-up created a NEW doc).
+        if (!disputeData.disputeRef && disputeData.orderId) {
+          const existing3 = await db.collection('orderTracker_disputes')
+            .where('orderId', '==', disputeData.orderId)
+            .limit(1).get();
+          if (!existing3.empty) {
+            const r = await applyEmailToExistingDispute(existing3.docs[0], disputeData, parsed.subject);
+            if (r !== 'already-recorded') updatedCount++;
+            logger.info(`IMAP: known order ${disputeData.orderId} (no ref) -> ${r}`);
+            continue;
+          }
+        }
+        // #12f: refuse junk docs — no usable reference means unparsable email
+        // (log it instead of creating another "URGENT"/"number" dispute).
+        if (!disputeData.disputeRef && !disputeData.orderId) {
+          skippedUnparsable++;
+          logger.warn(`IMAP: skipping unparsable email (no ref/orderId). Subject: ${parsed.subject || ''}`);
+          continue;
+        }
 
         // Determine team/client from To header or fallback
         let team = '';
@@ -1769,13 +2070,23 @@ async function readDisputeEmailsViaImap() {
           disputeRef: disputeData.disputeRef,
           orderId: disputeData.orderId,
           orderDocId: orderDoc ? orderDoc.id : '',
+          type: disputeData.type || '',
           reason: disputeData.reason,
+          outcome: disputeData.outcome || '',
           deadline: disputeData.deadline,
           status: 'Open',
           priority: 'medium',
           receivedAt: admin.firestore.FieldValue.serverTimestamp(),
           rawSubject: parsed.subject || '',
           rawBody: disputeData.rawBody,
+          messageId: disputeData.messageId || '',
+          emailHistory: [{
+            receivedAt: new Date().toISOString(),
+            subject: parsed.subject || '',
+            messageId: disputeData.messageId || '',
+            type: disputeData.type || '',
+            outcome: disputeData.outcome || '',
+          }],
           replyDraft: '',
           replySent: false,
           replySentAt: null,
@@ -1794,7 +2105,7 @@ async function readDisputeEmailsViaImap() {
     }
 
     imap.end();
-    return { processed, found: results.length };
+    return { processed, updated: updatedCount, skippedUnparsable, found: results.length };
   } catch (e) {
     imap.end();
     throw e;
@@ -1830,7 +2141,7 @@ exports.testImapConnection = onRequest(
 );
 
 // ============================================================================
-// ONE-CLICK DISPUTE REPLY — sends email from client's configured address
+// ONE-CLICK DISPUTE REPLY â€” sends email from client's configured address
 // ============================================================================
 
 async function getClientSmtpConfig(team) {
@@ -1907,7 +2218,7 @@ exports.sendDisputeReply = onRequest(
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      logger.info(`Dispute reply sent: ${disputeId} from ${smtp.fromEmail} → OnBuy. MessageId: ${info.messageId}`);
+      logger.info(`Dispute reply sent: ${disputeId} from ${smtp.fromEmail} â†’ OnBuy. MessageId: ${info.messageId}`);
       res.json({ success: true, messageId: info.messageId, sentFrom: smtp.fromEmail });
     } catch (e) {
       logger.error(`sendDisputeReply error: ${e.message}`);
