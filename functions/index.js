@@ -2352,3 +2352,154 @@ exports.sendDisputeReply = onRequest(
 );
 
 // ============================================================================
+
+// ============================================================================
+// ONE-TIME ORDER HISTORY BACKFILL (8 Aug 2026)
+// Why: system went live 23 Jul 2026 — every order before that was never
+// synced, so month filters (June etc.) show nothing and the costing import
+// reports most rows notInSystem. This pulls the FULL OnBuy order history
+// (dispatched + refunded + cancelled, paginated) and creates missing order
+// docs with createdAt = the REAL OnBuy order date (o.date), so dashboard
+// month filters land correctly. Existing orders are NEVER touched (VA edits
+// are sacred). Dry-run by default; add &execute=true to write.
+//   URL: .../importOrderHistory?key=ADMIN_KEY            (dry run, counts only)
+//        .../importOrderHistory?key=ADMIN_KEY&execute=true  (writes)
+//        optional &account=Samayy  (or Panacea) to do one account only
+// ============================================================================
+exports.importOrderHistory = onRequest(
+  { secrets: ALL_SECRETS, timeoutSeconds: 1800, memory: '1GiB' },
+  async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const execute = req.query.execute === 'true';
+    const wanted = String(req.query.account || 'all').toLowerCase();
+    const report = {};
+
+    const toTs = (s) => {
+      const d = new Date(String(s || '').replace(' ', 'T'));
+      return isNaN(d.getTime()) ? null : admin.firestore.Timestamp.fromDate(d);
+    };
+    const mapStatus = (st) => {
+      const s = String(st || '').toLowerCase();
+      if (s.includes('cancel')) return 'Cancelled';
+      if (s.includes('refund')) return 'Refunded';
+      if (s.includes('dispatch') || s.includes('shipped') || s.includes('complete')) return 'Dispatched';
+      return 'active';
+    };
+
+    for (const account of ACCOUNTS) {
+      if (wanted !== 'all' && account.name.toLowerCase() !== wanted) continue;
+      const accRep = { found: 0, alreadyInSystem: 0, toImport: 0, imported: 0, batches: 0, errors: [] };
+      report[account.name] = accRep;
+      try {
+        const token = await getOnBuyToken(account.consumerKey.value(), account.secretKey.value());
+
+        // Load ALL existing doc IDs for this account ONCE (single-field query,
+        // no composite index needed) — zero per-order reads afterwards.
+        const existingIds = new Set();
+        const snap = await db.collection('orderTracker_orders').where('account', '==', account.name).get();
+        snap.forEach((d) => existingIds.add(d.id));
+        logger.info(`${account.name}: ${existingIds.size} existing orders in Firestore.`);
+
+        let batch = db.batch();
+        let batchOps = 0;
+
+        for (const st of ['dispatched', 'refunded', 'cancelled']) {
+          for (let offset = 0; offset < 20000; offset += 100) {
+            const json = await onbuyGet(token,
+              `/orders?site_id=2000&filter[status]=${st}&sort[created]=asc&limit=100&offset=${offset}`);
+            const list = extractList(json, `history ${st} offset ${offset} (${account.name})`);
+            if (list.length === 0) break;
+
+            for (const o of list) {
+              const onbuyOrderId = String(o.order_id || o.id || o.order_number || '');
+              if (!onbuyOrderId) continue;
+              accRep.found += 1;
+              const docId = orderDocId(onbuyOrderId);
+              if (existingIds.has(docId)) { accRep.alreadyInSystem += 1; continue; }
+              accRep.toImport += 1;
+              existingIds.add(docId); // guard against dupes across status lists
+
+              if (execute) {
+                const item = (o.products && o.products[0]) || {};
+                const addr = o.delivery_address || {};
+                const mapped = mapStatus(o.status || st);
+                const orderDate = toTs(o.date || o.created);
+                const now = admin.firestore.FieldValue.serverTimestamp();
+                batch.set(db.collection('orderTracker_orders').doc(docId), {
+                  orgId: ORG_ID,
+                  team: account.team,
+                  account: account.name,
+                  platform: '',
+                  orderNo: onbuyOrderId,
+                  onbuyOrderId,
+                  sku: item.sku || o.sku || '',
+                  opc: item.opc || o.opc || '',
+                  item: item.title || item.name || o.product_title || 'Imported from OnBuy',
+                  qty: Number(item.quantity || o.quantity || 1),
+                  sellingPrice: Number(o.price_total ?? o.total ?? item.price ?? 0),
+                  onbuyFee: Number(o.sales_fee_inc_VAT ?? o.sales_fee_ex_VAT ?? o.sales_fee ?? 0),
+                  amount: 0,                    // costing import fills this next
+                  sourceOrderNo: '',
+                  sourceLink: '',
+                  notes: '',
+                  buyerName: addr.name || (o.buyer && o.buyer.name) || '',
+                  buyerPhone: extractBuyerPhone(o),
+                  buyerEmail: (o.buyer && o.buyer.email) || '',
+                  buyerAddress: [addr.line_1, addr.town].filter(Boolean).join(', '),
+                  buyerPostcode: addr.postcode || '',
+                  onbuyOrderDate: (o.date || o.created || '').slice(0, 10),
+                  status: mapped,               // history import owns status here (no VA ever saw these)
+                  statusSource: 'history_import',
+                  onbuyStatus: o.status || st,
+                  trackingNumber: '',
+                  trackingCarrier: '',
+                  dispatchedToOnbuy: mapped === 'Dispatched',
+                  dispatchedAt: mapped === 'Dispatched' ? (toTs(o.shipped_at) || null) : null,
+                  unlockedTeam: null,
+                  unlockRequested: false,
+                  unlockRequestReason: null,
+                  refundAmount: null,
+                  refundReason: null,
+                  refundAt: mapped === 'Refunded' ? now : null,
+                  lastEditedAt: null,
+                  importedFromApi: true,
+                  needsSourcingInfo: true,
+                  onbuyRefunds: o.refunds || null,
+                  onbuyCancellation: o.cancellation || null,
+                  onbuyDispatches: o.dispatches || null,
+                  createdAt: orderDate || now,  // REAL order date — month filters land correctly
+                  lastSyncedAt: now,
+                });
+                batchOps += 1;
+                accRep.imported += 1;
+                if (batchOps >= 400) {
+                  await batch.commit();
+                  accRep.batches += 1;
+                  batch = db.batch();
+                  batchOps = 0;
+                }
+              }
+            }
+            if (list.length < 100) break; // last page
+          }
+        }
+        if (execute && batchOps > 0) {
+          await batch.commit();
+          accRep.batches += 1;
+        }
+      } catch (e) {
+        logger.error(`importOrderHistory ${account.name}: ${e.message}`);
+        accRep.errors.push(e.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      dryRun: !execute,
+      report,
+      message: execute
+        ? 'History import complete. Re-run the costing import now — notInSystem rows should match.'
+        : 'DRY RUN — nothing written. Add &execute=true to import for real.',
+    });
+  }
+);
