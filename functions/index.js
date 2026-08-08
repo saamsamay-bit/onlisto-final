@@ -565,7 +565,8 @@ async function pullListingsForAccount(account) {
         category: l.category || '',
         brandName: l['brand name'] || l.brand_name || '',
         gtin: l.gtin || '',
-        onbuyProductId: l.product_id || l.productId || '',  // enables direct public OnBuy page links
+        onbuyUrl: l.product_url || '',  // probe-proven 8 Aug 2026: direct public OnBuy page URL
+        onbuyProductId: l.product_encoded_id || '',  // fallback ID for public page links
         lastCheckedAt: now,
         _fp: fp,
       }, { merge: true });
