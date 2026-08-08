@@ -565,6 +565,7 @@ async function pullListingsForAccount(account) {
         category: l.category || '',
         brandName: l['brand name'] || l.brand_name || '',
         gtin: l.gtin || '',
+        onbuyProductId: l.product_id || l.productId || '',  // enables direct public OnBuy page links
         lastCheckedAt: now,
         _fp: fp,
       }, { merge: true });
@@ -1227,6 +1228,93 @@ exports.manualSourceCheck = onRequest({ cors: true }, async (req, res) => {
   }
 });
 
+// BULK IMPORT — sourcing cost + buying link + supplier order no from the P&L sheet.
+// Up to 50 rows per call. Order match: onbuyOrderId. Listing match: opc (single-field query).
+// Never clobbers a VA-entered cost/link or a manually-checked listing price.
+exports.importOrderCosts = onRequest({ cors: true, timeoutSeconds: 300 }, async (req, res) => {
+  if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
+  if (!checkAdminKey(req, res)) return;
+
+  const rows = (req.body && req.body.rows) || [];
+  const dryRun = !!(req.body && req.body.dryRun);
+  if (!Array.isArray(rows) || !rows.length) {
+    return res.status(400).json({ error: 'Send rows: [{ orderNo, unitCost, totalCost, link, supplierOrderNo }] (max 50)' });
+  }
+  if (rows.length > 50) return res.status(400).json({ error: 'Max 50 rows per call — batch them.' });
+
+  const detectPlatform = (url) => {
+    const u = String(url || '').toLowerCase();
+    if (u.includes('amazon.')) return 'Amazon';
+    if (u.includes('ebay.')) return 'eBay';
+    if (u.includes('aliexpress.')) return 'AliExpress';
+    return u ? 'Other' : '';
+  };
+
+  const results = [];
+  let ordersUpdated = 0, listingsUpdated = 0, ordersMissing = 0, skipped = 0;
+
+  for (const row of rows) {
+    const orderNo = String(row.orderNo || '').trim().toUpperCase();
+    const unitCost = Number(row.unitCost) || 0;
+    const totalCost = Number(row.totalCost) || unitCost;
+    const link = String(row.link || '').trim();
+    const supplierOrderNo = String(row.supplierOrderNo || '').trim();
+    if (!orderNo || (totalCost <= 0 && !link)) { skipped++; results.push({ orderNo, result: 'skipped-empty' }); continue; }
+
+    try {
+      const snap = await db.collection('orderTracker_orders').where('onbuyOrderId', '==', orderNo).limit(1).get();
+      if (snap.empty) { ordersMissing++; results.push({ orderNo, result: 'order-not-in-system' }); continue; }
+      const orderDoc = snap.docs[0];
+      const o = orderDoc.data();
+
+      if (!dryRun) {
+        const orderUpdate = {};
+        if (totalCost > 0 && !(Number(o.amount) > 0)) orderUpdate.amount = totalCost;  // keep any VA-entered cost
+        if (link && !o.sourceLink) { orderUpdate.sourceLink = link; orderUpdate.sourcePlatform = detectPlatform(link); }
+        if (supplierOrderNo && !o.sourceOrderNo) orderUpdate.sourceOrderNo = supplierOrderNo;
+        if (o.needsSourcingInfo) orderUpdate.needsSourcingInfo = false;
+        if (Object.keys(orderUpdate).length) {
+          orderUpdate.costImportedAt = admin.firestore.FieldValue.serverTimestamp();
+          await orderDoc.ref.set(orderUpdate, { merge: true });
+        }
+      }
+      ordersUpdated++;
+
+      // Chain to the listing via the order's OPC (single-field query — no composite index)
+      let listingResult = 'no-opc-on-order';
+      if (o.opc) {
+        const lsnap = await db.collection('orderTracker_listings').where('opc', '==', o.opc).limit(3).get();
+        const ldoc = lsnap.docs.find(d => (d.data().team || '') === o.team) || lsnap.docs[0];
+        if (ldoc) {
+          const l = ldoc.data();
+          const mayOverwrite = !l.sourcePrice || l.sourceCheckMethod === 'import';
+          if (mayOverwrite && unitCost > 0 && !dryRun) {
+            await ldoc.ref.set({
+              sourcePrice: unitCost,
+              ...(link ? { sourceUrl: link } : {}),
+              sourceCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
+              sourceCheckedBy: 'import',
+              sourceCheckMethod: 'import',
+              checkTier: 'B',
+              consecutiveNoChange: 0,
+            }, { merge: true });
+            listingsUpdated++;
+            listingResult = 'listing-updated';
+          } else {
+            listingResult = mayOverwrite ? 'listing-dryrun' : 'listing-kept-fresher-data';
+          }
+        } else listingResult = 'listing-not-found';
+      }
+      results.push({ orderNo, result: 'ok', listing: listingResult });
+    } catch (e) {
+      results.push({ orderNo, result: 'error: ' + e.message });
+    }
+  }
+
+  logger.info(`importOrderCosts: ${ordersUpdated} orders, ${listingsUpdated} listings, ${ordersMissing} missing, ${skipped} skipped`);
+  res.json({ success: true, dryRun, ordersUpdated, listingsUpdated, ordersMissing, skipped, results });
+});
+
 // VA adds/updates a listing's source URL â€” scheduled checker picks it up.
 exports.updateListingSource = onRequest({ cors: true }, async (req, res) => {
   if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
@@ -1433,6 +1521,7 @@ exports.probeOnBuyData = onRequest(
     };
 
     // Candidate endpoints â€” OnBuy docs are a Postman collection; status codes tell the truth.
+    await probe('listingRaw', '/listings?site_id=2000&country_code=GB&limit=1&offset=0');
     await probe('refundedOrders', '/orders?site_id=2000&filter[status]=refunded&limit=2&offset=0');
     await probe('cancelledOrders', '/orders?site_id=2000&filter[status]=cancelled&sort[created]=desc&limit=2&offset=0');
     await probe('dispatchedOrders', '/orders?site_id=2000&filter[status]=dispatched&sort[created]=desc&limit=1&offset=0');
