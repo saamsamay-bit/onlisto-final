@@ -353,7 +353,7 @@ async function syncStatusFromOnBuy(account, o) {
     if (!ex.refundAt) updates.refundAt = now;
   }
 
-  const alreadyHandled = currentStatus.toLowerCase() === 'dispatched' || currentStatus === 'Cancelled';
+  const alreadyHandled = currentStatus.toLowerCase() === 'dispatched' || currentStatus === 'Cancelled' || currentStatus === 'Refunded' || !!ex.onbuyRefunds || !!ex.onbuyCancellation;
   if (onbuySaysDispatched && !alreadyHandled) {
     updates.status = 'Dispatched';
     updates.statusSource = 'onbuy_sync'; // so we know WHO dispatched (OnBuy direct, not dashboard)
@@ -2500,6 +2500,137 @@ exports.importOrderHistory = onRequest(
       message: execute
         ? 'History import complete. Re-run the costing import now — notInSystem rows should match.'
         : 'DRY RUN — nothing written. Add &execute=true to import for real.',
+    });
+  }
+);
+// ---------------------------------------------------------------------------
+// STATUS REFRESH (9 Aug 2026) — fix orders stuck "Dispatched"/"active" in
+// Firestore after OnBuy later refunded/cancelled them.
+// Root cause: the 15-min sync only re-checks the NEWEST 300 dispatched /
+// 300 refunded / 100 cancelled orders (offset caps in pullOrdersForAccount).
+// Anything older is never re-seen, so the dashboard keeps counting refunded
+// sales as profit (user-reported: 26 June orders, ~£609 fake profit).
+// Same rules as syncStatusFromOnBuy: refunded -> status follows OnBuy
+// one-way; cancelled -> flag needsAttention for a human (never auto-status).
+// The raw mirrors (onbuyRefunds/onbuyCancellation/onbuyStatus) are what fix
+// the P&L math — the dashboard's orderState reads those fields directly.
+// DRY-RUN BY DEFAULT. &execute=true writes. &account=panacea|samayy optional.
+// ---------------------------------------------------------------------------
+exports.refreshOrderStatuses = onRequest(
+  { secrets: ALL_SECRETS, timeoutSeconds: 1800, memory: '1GiB' },
+  async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const execute = req.query.execute === 'true';
+    const wanted = String(req.query.account || 'all').toLowerCase();
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const report = {};
+
+    for (const account of ACCOUNTS) {
+      if (wanted !== 'all' && account.team !== wanted && account.name.toLowerCase() !== wanted) continue;
+      const rep = {
+        mode: execute ? 'EXECUTE' : 'DRY-RUN',
+        scanned: { refunded: 0, cancelled: 0 },
+        wouldSetRefunded: 0, wouldFlagCancelled: 0,
+        mirrorsOnly: 0, alreadyCorrect: 0, notInSystem: 0, errors: 0,
+        sampleSetRefunded: [], sampleFlagCancelled: [], sampleNotInSystem: [],
+      };
+      report[account.name] = rep;
+      try {
+        const token = await getOnBuyToken(account.consumerKey.value(), account.secretKey.value());
+        let batch = db.batch();
+        let inBatch = 0;
+        const flush = async () => {
+          if (execute && inBatch > 0) { await batch.commit(); }
+          batch = db.batch();
+          inBatch = 0;
+        };
+
+        for (const kind of ['refunded', 'cancelled']) {
+          for (let offset = 0; offset < 20000; offset += 100) {
+            const json = await onbuyGet(token,
+              `/orders?site_id=2000&filter[status]=${kind}&sort[created]=desc&limit=100&offset=${offset}`);
+            const list = extractList(json, `status-refresh ${kind} offset ${offset} (${account.name})`);
+            if (!list.length) break;
+            rep.scanned[kind] += list.length;
+
+            for (const o of list) {
+              const onbuyOrderId = String(o.order_id || '');
+              if (!onbuyOrderId) continue;
+              const onbuyStatus = o.status || kind;
+              try {
+                const ref = db.collection('orderTracker_orders').doc(orderDocId(onbuyOrderId));
+                const snap = await ref.get();
+                if (!snap.exists) {
+                  rep.notInSystem++;
+                  if (rep.sampleNotInSystem.length < 20) rep.sampleNotInSystem.push(onbuyOrderId);
+                  continue;
+                }
+                const ex = snap.data();
+                const cur = String(ex.status || '');
+                const updates = { lastSyncedAt: now };
+
+                // Mirrors — the fields the dashboard's orderState reads.
+                if ((ex.onbuyStatus || '') !== onbuyStatus) updates.onbuyStatus = onbuyStatus;
+                const rawMirror = [['refunds', 'onbuyRefunds'], ['cancellation', 'onbuyCancellation'], ['dispatches', 'onbuyDispatches']];
+                for (const [srcField, dstField] of rawMirror) {
+                  if (o[srcField] !== undefined) {
+                    const incoming = JSON.stringify(o[srcField] || null);
+                    if (incoming !== JSON.stringify(ex[dstField] || null)) updates[dstField] = o[srcField] || null;
+                  }
+                }
+
+                let action = '';
+                if (kind === 'refunded' && cur !== 'Refunded' && cur !== 'Cancelled') {
+                  updates.status = 'Refunded';
+                  updates.statusSource = 'status_refresh';
+                  if (!ex.refundAt) updates.refundAt = now;
+                  action = 'refunded';
+                } else if (kind === 'cancelled' && cur !== 'Cancelled' && !ex.needsAttention) {
+                  updates.needsAttention = true;
+                  updates.attentionReason = `OnBuy shows: ${onbuyStatus}`;
+                  action = 'cancelled';
+                }
+
+                if (action === 'refunded') {
+                  rep.wouldSetRefunded++;
+                  if (rep.sampleSetRefunded.length < 30) rep.sampleSetRefunded.push(`${onbuyOrderId} (was: ${cur || '?'})`);
+                } else if (action === 'cancelled') {
+                  rep.wouldFlagCancelled++;
+                  if (rep.sampleFlagCancelled.length < 30) rep.sampleFlagCancelled.push(`${onbuyOrderId} (was: ${cur || '?'})`);
+                } else if (Object.keys(updates).length > 1) {
+                  rep.mirrorsOnly++;
+                } else {
+                  rep.alreadyCorrect++;
+                  continue;
+                }
+
+                if (execute) {
+                  batch.update(ref, updates);
+                  inBatch++;
+                  if (inBatch >= 400) await flush();
+                }
+              } catch (e) {
+                rep.errors++;
+                logger.error(`status-refresh ${onbuyOrderId}: ${e.message}`);
+              }
+            }
+            if (list.length < 100) break; // last page
+          }
+        }
+        await flush();
+      } catch (e) {
+        rep.fatalError = e.message;
+        logger.error(`refreshOrderStatuses ${account.name}: ${e.message}`);
+      }
+    }
+
+    res.json({
+      success: true,
+      mode: execute ? 'EXECUTE' : 'DRY-RUN (nothing written — add &execute=true to write)',
+      report,
+      message: execute
+        ? 'Status refresh complete. Reload the dashboard and re-check the month that looked wrong.'
+        : 'DRY RUN — nothing written. Check the counts, then add &execute=true to fix for real.',
     });
   }
 );

@@ -67,3 +67,15 @@ node_modules/
 
 # dataconnect generated files
 .dataconnect
+
+serviceAccountKey.json
+
+key.txt
+order-costs-import.csv
+index (14).html
+
+index-backup-v5.js
+
+serviceAccountKey*.json*
+
+test.txt

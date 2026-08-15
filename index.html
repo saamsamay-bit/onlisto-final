@@ -468,6 +468,7 @@
                 <button class="courier" data-c="Other" onclick="pickCourier(this)"><span class="c-dot" style="background:#64748b"></span>Other</button>
             </div>
             <input type="text" id="trackingInput" class="inp" placeholder="Tracking number">
+            <input type="text" id="supplierOrderInput" class="inp" placeholder="Amazon/eBay order # (optional — e.g. 202-1234567-1234567)" style="margin-top:8px">
             <div class="modal-actions">
                 <button class="btn btn-ghost" onclick="closeModal('dispatchModal')">Cancel</button>
                 <button class="btn btn-success" onclick="confirmDispatch()">Confirm Dispatch</button>
@@ -617,6 +618,8 @@
                 <button class="btn btn-soft" onclick="copyReply()">Copy to Clipboard</button>
                 <button class="btn btn-success" onclick="markReplied()">Copy &amp; Mark as Replied</button>
             </div>
+        </div>
+    </div>
     
     <!-- ================= DISPUTE DETAIL MODAL (v2) ================= -->
     <div id="disputeDetailModal" class="modal-overlay hidden">
@@ -701,8 +704,6 @@
                 <button onclick="closeModal('disputeDetailModal')" class="btn btn-ghost">Close</button>
             </div>
         </div>
-    </div>
-    </div>
     </div>
 
     <!-- ================= RESTOCK MODAL ================= -->
@@ -978,12 +979,26 @@
                     <span class="chip-pending" id="pendingChip">0 pending dispatch</span>
                 </div>
                 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:center">
+                    <span class="small" style="font-weight:800;color:var(--muted)">📅 Range:</span>
+                    <input type="date" id="ordDateFrom" class="inp" style="width:auto;padding:6px 10px">
+                    <span class="small muted">to</span>
+                    <input type="date" id="ordDateTo" class="inp" style="width:auto;padding:6px 10px">
+                    <button class="btn btn-primary btn-sm" onclick="applyOrderDateRange()">Apply</button>
+                    <button class="btn btn-ghost btn-sm" onclick="presetOrderRange('today')">Today</button>
+                    <button class="btn btn-ghost btn-sm" onclick="presetOrderRange('7d')">7 days</button>
+                    <button class="btn btn-ghost btn-sm" onclick="presetOrderRange('30d')">30 days</button>
+                    <button class="btn btn-ghost btn-sm" onclick="presetOrderRange('all')">All time</button>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:center">
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_all" onclick="setOrderView('all')">All</button>
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_pending" onclick="setOrderView('pending')">Pending</button>
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_dispatched" onclick="setOrderView('dispatched')">Dispatched</button>
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_cancelled" onclick="setOrderView('cancelled')">Cancelled</button>
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_refunded" onclick="setOrderView('refunded')">Refunded</button>
-                    <span id="orderPager" style="margin-left:auto" class="small muted"></span>
+                    <input type="text" id="orderSearchInput" class="inp" placeholder="Search order ID…" style="width:180px;margin-left:auto" onkeydown="if(event.key==='Enter')searchOrders()">
+                    <button class="btn btn-primary btn-sm" onclick="searchOrders()">Search</button>
+                    <button class="btn btn-ghost btn-sm" onclick="clearOrderSearch()">Clear</button>
+                    <span id="orderPager" class="small muted"></span>
                 </div>
                 <div class="table-wrap">
                     <table>
@@ -1210,8 +1225,8 @@
                 <!-- Filters -->
                 <div class="dispute-filters">
                     <select id="disputeFilterStatus" onchange="loadDisputesFromApi()">
-                        <option value="">All Status</option>
-                        <option value="Open" selected>Open</option>
+                        <option value="" selected>All Status</option>
+                        <option value="Open">Open</option>
                         <option value="In Progress">In Progress</option>
                         <option value="Resolved">Resolved</option>
                     </select>
@@ -1261,9 +1276,9 @@
                         <p style="margin:10px 0 4px"><b>For EXISTING clients:</b> set up auto-forward from their Gmail:</p>
                         <ol>
                             <li>In the client's Gmail, open <b>Settings → Forwarding and POP/IMAP → Add a forwarding address</b>.</li>
-                            <li>Enter their dispute inbox: <code>disputes+clientname@onlisto.io</code> and confirm the verification email (it arrives in your Onlisto inbox).</li>
-                            <li>Go to <b>Settings → Filters → Create a new filter</b>: in <b>From</b> put <code>customersupport-gb@onbuy.com</code>, in <b>Has the words</b> put <code>dispute OR chargeback OR escalation OR "we need your help"</code>.</li>
-                            <li>Click <b>Create filter</b> → tick <b>Forward it to:</b> and choose <code>disputes+clientname@onlisto.io</code> → <b>Create filter</b>.</li>
+                            <li>Enter their dispute inbox: <code><a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="9efaf7edeeebeafbedb5fdf2f7fbf0eaf0fff3fbdef1f0f2f7edeaf1b0f7f1">[email&#160;protected]</a></code> and confirm the verification email (it arrives in your Onlisto inbox).</li>
+                            <li>Go to <b>Settings → Filters → Create a new filter</b>: in <b>From</b> put <code><a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="2b485e585f44464e59585e5b5b44595f064c496b4445495e5205484446">[email&#160;protected]</a></code>, in <b>Has the words</b> put <code>dispute OR chargeback OR escalation OR "we need your help"</code>.</li>
+                            <li>Click <b>Create filter</b> → tick <b>Forward it to:</b> and choose <code><a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="74101d0704010011075f17181d111a001a151911341b1a181d07001b5a1d1b">[email&#160;protected]</a></code> → <b>Create filter</b>.</li>
                         </ol>
                         <p style="margin:10px 0 0">The Cloud Function parser reads every forwarded email automatically: order ID, dispute reference, reason, deadline, fee amount and type are extracted and appear in the table above. When a real email arrives, the parser patterns are refined in one patch.</p>
                     </div>
@@ -1435,7 +1450,7 @@
         </section>
     </main>
 
-    <script type="module">
+    <script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut }
             from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
@@ -1679,6 +1694,7 @@
             loadPerf();
             if (isAdmin()) { loadBizSettings().then(() => calculatePNL()); watchExpenses(); }
             saaBoot();
+            loadDisputesFromApi();   // auto-load disputes on startup
         }
 
 
@@ -1770,13 +1786,22 @@
         $('skuSearch').addEventListener('keyup', e => { if (e.key === 'Enter') searchListings(); });
 
         /* ================= ORDERS ================= */
+        let ordersUnsub = null;
         function fetchOrders() {
-            const parts = [orderBy("createdAt", "desc")];
+            // Range-aware (8 Aug 2026): with 9,700+ orders after the history
+            // backfill, the old "newest 500 only" feed made older months
+            // invisible. When a date range is set, re-query Firestore FOR
+            // THAT RANGE (up to 5000) so June/2023 orders load on demand.
+            const parts = [];
             const acc = vaAccount();
             if (acc) parts.push(where("team", "==", acc));
-            parts.push(limit(500));
+            if (window._dateFrom) parts.push(where("createdAt", ">=", window._dateFrom));
+            if (window._dateTo) parts.push(where("createdAt", "<=", window._dateTo));
+            parts.push(orderBy("createdAt", "desc"));
+            parts.push(limit((window._dateFrom || window._dateTo) ? 5000 : 500));
             const q = query(collection(db, "orderTracker_orders"), ...parts);
-            onSnapshot(q, async snap => {
+            if (ordersUnsub) ordersUnsub();
+            ordersUnsub = onSnapshot(q, async snap => {
                 allOrders = [];
                 snap.forEach(d => allOrders.push({ id: d.id, ...d.data() }));
                 await Promise.all(allOrders.map(async o => { o._plainLink = await plainLink(o.sourceLink); }));
@@ -1806,8 +1831,9 @@
             const f = $('dateFrom').value, t = $('dateTo').value;
             window._dateFrom = f ? Timestamp.fromDate(new Date(f + 'T00:00:00')) : null;
             window._dateTo = t ? Timestamp.fromDate(new Date(t + 'T23:59:59')) : null;
-            renderOrders(); calculatePNL();
-            toast('Date range applied to KPI cards.', 'success');
+            window._orderPage = 1;
+            fetchOrders();   // re-queries Firestore for this exact range; renderOrders + calculatePNL run when data arrives
+            toast(f || t ? 'Loading orders for that range…' : 'Filter cleared — back to the newest orders.', 'success');
         };
         window.presetRange = function(p) {
             const today = new Date(); const iso = d => d.toISOString().slice(0, 10);
@@ -1838,10 +1864,68 @@
         window._orderView = window._orderView || 'all';
         window._orderPage = window._orderPage || 1;
         window.setOrderView = function(v) { window._orderView = v; window._orderPage = 1; renderOrders(); };
+        /* ================= ORDERS DATE FILTER (works for VA + admin) ================= */
+        window.applyOrderDateRange = function() {
+            const f = $('ordDateFrom').value, t = $('ordDateTo').value;
+            window._dateFrom = f ? Timestamp.fromDate(new Date(f + 'T00:00:00')) : null;
+            window._dateTo = t ? Timestamp.fromDate(new Date(t + 'T23:59:59')) : null;
+            window._orderPage = 1;
+            fetchOrders();   // re-queries Firestore for this exact range — older months/years load on demand
+            toast(f || t ? 'Loading orders for that range…' : 'Date filter cleared — back to the newest orders.', 'success');
+        };
+        window.presetOrderRange = function(p) {
+            const today = new Date(); const iso = d => d.toISOString().slice(0, 10);
+            if (p === 'all') { $('ordDateFrom').value = ''; $('ordDateTo').value = ''; }
+            else if (p === 'today') { $('ordDateFrom').value = iso(today); $('ordDateTo').value = iso(today); }
+            else if (p === '7d') { const d = new Date(); d.setDate(d.getDate() - 7); $('ordDateFrom').value = iso(d); $('ordDateTo').value = iso(today); }
+            else if (p === '30d') { const d = new Date(); d.setDate(d.getDate() - 30); $('ordDateFrom').value = iso(d); $('ordDateTo').value = iso(today); }
+            applyOrderDateRange();
+        };
+        window._orderSearchResults = null;
+        window.searchOrders = async function() {
+            const term = $('orderSearchInput').value.trim().toUpperCase();
+            if (!term) { toast('Type an order ID to search.', 'info'); return; }
+            toast('Searching all orders for: ' + term + '…', 'info');
+            try {
+                let q1 = query(collection(db, "orderTracker_orders"), where("onbuyOrderId", "==", term), limit(50));
+                let snap1 = await getDocs(q1);
+                let results = [];
+                snap1.forEach(d => results.push({ id: d.id, ...d.data() }));
+                if (results.length === 0) {
+                    let q2 = query(collection(db, "orderTracker_orders"), where("orderNo", "==", term), limit(50));
+                    let snap2 = await getDocs(q2);
+                    snap2.forEach(d => results.push({ id: d.id, ...d.data() }));
+                }
+                if (results.length === 0) {
+                    const all = getVisibleOrders();
+                    results = all.filter(o => 
+                        (o.onbuyOrderId || '').toUpperCase().includes(term) ||
+                        (o.orderNo || '').toUpperCase().includes(term) ||
+                        (o.item || '').toLowerCase().includes(term.toLowerCase())
+                    );
+                }
+                if (results.length === 0) {
+                    toast('No order found for: ' + term, 'error');
+                    $('ordersTableBody').innerHTML = '<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--red)">No order found for <b>' + esc(term) + '</b> across all historical data.</td></tr>';
+                    return;
+                }
+                window._orderSearchResults = results;
+                renderOrders();
+                toast('Found ' + results.length + ' order(s).', 'success');
+            } catch (e) {
+                toast('Search failed: ' + e.message, 'error');
+            }
+        };
+        window.clearOrderSearch = function() {
+            $('orderSearchInput').value = '';
+            window._orderSearchResults = null;
+            renderOrders();
+        };
 
         window.renderOrders = function() {
             const tbody = $('ordersTableBody');
-            const stateFiltered = getVisibleOrders().filter(o => inDateRange(o) &&
+            const baseOrders = window._orderSearchResults || getVisibleOrders();
+            const stateFiltered = baseOrders.filter(o => inDateRange(o) &&
                 (window._orderView === 'all' ? true : orderState(o) === window._orderView));
             const PAGE = 50;
             const pages = Math.max(1, Math.ceil(stateFiltered.length / PAGE));
@@ -1878,7 +1962,8 @@
                 } else if (dispatched) {
                     statusHtml = `<span class="badge badge-success">Dispatched</span><br>
                        <span class="small" style="font-weight:800;color:var(--ink)">${esc(o.trackingCarrier || '')}</span><br>
-                       <span class="small muted mono">${esc(o.trackingNumber || '')}</span>`;
+                       <span class="small muted mono">${esc(o.trackingNumber || '')}</span>` +
+                       (o.sourceOrderNo ? `<br><span class="small muted" title="Supplier order number">🛒 ${esc(o.sourceOrderNo)}</span>` : '');
                 } else if (flagged) {
                     statusHtml = `<span class="badge badge-urgent"><span class="pulse"></span>Blocked</span><br>
                        <span class="small" style="color:var(--red);font-weight:700">Flagged: ${esc(bannedHit.brandName)}</span><br>` +
@@ -1935,8 +2020,13 @@
                         <div style="display:flex;gap:6px">
                             <input type="number" id="order-cost-${o.id}" class="inp" placeholder="Cost £" value="${o.amount ?? ''}" style="width:90px">
                             <button onclick="updateOrderSourcing('${o.id}')" class="btn btn-success btn-sm" style="flex:1">Save &amp; Calc</button>
+                            ${o._plainLink ? `<a href="${esc(o._plainLink)}" target="_blank" class="btn btn-soft btn-sm" style="flex:none" title="Open the buying page (Amazon/eBay)">Open ↗</a>` : ''}
                         </div>
-                        <div class="small" style="margin-top:6px">Profit: <b style="color:${pColor}">${fmt(profit)}</b> ${lockIc} ${pBadge}${cost === 0 ? ' <span class="badge badge-warning">no cost set</span>' : ''}</div>
+                        <div class="small" style="margin-top:6px">${oState === 'cancelled'
+                            ? 'Profit: <b>—</b> <span class="badge badge-danger">cancelled — not counted</span>'
+                            : oState === 'refunded'
+                                ? `Loss: <b style="color:var(--red)">−${fmt(cost)}</b> <span class="badge" style="background:#fff7ed;color:#c2410c;border:1px solid #fdba74">refunded</span>`
+                                : `Profit: <b style="color:${pColor}">${fmt(profit)}</b> ${lockIc} ${pBadge}${cost === 0 ? ' <span class="badge badge-warning">no cost set</span>' : ''}`}</div>
                     </td>
                     <td>${contactHtml}</td>
                     <td style="min-width:140px">${statusHtml}</td>
@@ -1944,10 +2034,16 @@
             });
 
             tbody.innerHTML = rows.length ? rows.join('')
-                : `<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted)">No orders in this view yet.</td></tr>`;
+                : (window._orderSearchResults 
+                    ? `<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted)">No orders match your search. Try a different order ID.</td></tr>`
+                    : `<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted)">No orders in this view yet.</td></tr>`);
             $('pendingChip').textContent = `${pending} pending dispatch`;
             const pager = $('orderPager');
             if (pager) {
+                if (window._orderSearchResults) {
+                    pager.innerHTML = `<span class="muted">${stateFiltered.length} search results · <button class="btn btn-ghost btn-sm" onclick="clearOrderSearch()">Clear search</button></span>`;
+                    return;
+                }
                 pager.innerHTML = pages > 1
                     ? `<button class="btn btn-ghost btn-sm" ${window._orderPage <= 1 ? 'disabled' : ''} onclick="window._orderPage--;renderOrders()">‹ Prev</button>
                        <b> Page ${window._orderPage} of ${pages} </b>
@@ -2056,50 +2152,62 @@
             }
             const pct = Number(bizSettings.sourcingPct) || 0;
             const expAll = expensesAllTime();
-            // --- totals ---
-            try {
-                const d = await trySum(wh);
-                const srcFee = (d.costs || 0) * pct / 100;
-                animateValue($('totalSales'), d.sales || 0);
-                animateValue($('netProfit'), profitOf(d) - srcFee - expAll);
-                animateValue($('totalOnBuyFees'), d.fees || 0);
-                notes.push(f === 'All Accounts' ? 'Live server-side sums across ALL orders.' : `Live server-side sums across all ${f} orders.`);
-                if (pct > 0 || expAll > 0) notes.push(`Net Profit is after deductions — sourcing fee ${pct}% (−${fmt(srcFee)})${expAll > 0 ? ` and expenses (−${fmt(expAll)})` : ''}.`);
-            } catch (e) {
-                console.error('P&L totals aggregation error:', e);
-                let s = 0, p = 0, c = 0, f = 0;
-                getVisibleOrders().filter(inDateRange).forEach(o => { const sale = Number(o.sellingPrice) || 0; const cost = Number(o.amount) || 0; const fee = Number(o.onbuyFee) || 0; s += sale; c += cost; f += fee; p += sale - fee - cost; });
-                animateValue($('totalSales'), s);
-                animateValue($('netProfit'), p - (c * pct / 100) - expAll);
-                animateValue($('totalOnBuyFees'), f);
-                const link = indexLink(e);
-                notes.push(`⚙️ <b>One-time setup needed:</b> totals currently use the latest 50 orders.` + (link ? ` <a href="${link}" target="_blank" style="color:var(--indigo);font-weight:800">Click here, sign into Firebase & press “Create index”</a> — it builds in ~2 minutes, then this card switches to live all-time totals automatically.` : ''));
-                if (pct > 0 || expAll > 0) notes.push(`Net Profit is after deductions — sourcing fee ${pct}% (−${fmt(c * pct / 100)})${expAll > 0 ? ` and expenses (−${fmt(expAll)})` : ''}.`);
+            // --- totals (state-aware: cancelled & refunded handled per agreed rules) ---
+            // Paginated FULL scan of the selected scope (account + date range).
+            // The old limit(5000) with no orderBy grabbed an arbitrary doc-ID
+            // chunk and silently dropped the rest — broken the moment the
+            // history backfill pushed total orders past 5,000 (8 Aug 2026).
+            const pnlDocs = [];
+            let pnlLast = null;
+            for (let pg = 0; pg < 20; pg++) {          // 20 × 5000 = 100k orders safety cap
+                const pnlParts = [...wh, orderBy('createdAt', 'desc'), limit(5000)];
+                if (pnlLast) pnlParts.push(startAfter(pnlLast));
+                const pnlPage = await getDocs(query(collection(db, "orderTracker_orders"), ...pnlParts));
+                pnlPage.forEach(d => pnlDocs.push(d));
+                if (pnlPage.size < 5000) break;
+                pnlLast = pnlPage.docs[pnlPage.docs.length - 1];
             }
-            // --- VA splits ---
-            if (f === 'All Accounts') {
-                try {
-                    const [pd, sd] = await Promise.all([trySum([where('account', '==', 'Panacea'), ...dwh]), trySum([where('account', '==', 'Samayy'), ...dwh])]);
-                    animateValue($('panaceaSplit'), profitOf(pd) * 0.30);
-                    animateValue($('samayySplit'), profitOf(sd) * 0.20);
-                } catch (e) {
-                    console.error('P&L splits aggregation error:', e);
-                    let pan = 0, sam = 0;
-                    allOrders.filter(inDateRange).forEach(o => {
-                        const p = (Number(o.sellingPrice) || 0) - (Number(o.onbuyFee) || 0) - (Number(o.amount) || 0);
-                        if (o.team === 'panacea') pan += p;
-                        if (o.team === 'samayy') sam += p;
-                    });
-                    animateValue($('panaceaSplit'), pan * 0.30);
-                    animateValue($('samayySplit'), sam * 0.20);
-                    const link = indexLink(e);
-                    if (link) notes.push(`VA splits also use the latest 50 orders until you <a href="${link}" target="_blank" style="color:var(--indigo);font-weight:800">create the second index</a> (same one-click step).`);
+            let s = 0, c = 0, f2 = 0, refundLoss = 0, cancelFees = 0, cancelN = 0, refundN = 0;
+            let pan = 0, sam = 0;
+            const zeroCost = [];   // dispatched/active orders with no sourcing cost on record — profit inflated
+            pnlDocs.forEach(d => {
+                const o = d.data();
+                if (!inDateRange(o)) return;
+                if (f !== 'All Accounts' && o.team !== f.toLowerCase()) return;
+                const st = orderState(o);
+                const sale = Number(o.sellingPrice) || 0, fee = Number(o.onbuyFee) || 0, cost = Number(o.amount) || 0;
+                if (st === 'cancelled') { cancelN++; cancelFees += fee; return; }   // no money moved — excluded; fee flagged below
+                if (st === 'refunded') {                                            // sale reversed; real loss = sourcing cost already paid
+                    refundN++; refundLoss += cost;
+                    if (o.team === 'panacea') pan -= cost; else if (o.team === 'samayy') sam -= cost;
+                    return;
                 }
-            } else {
-                $('panaceaSplit').textContent = '—';
-                $('samayySplit').textContent = '—';
-                notes.push('Switch to All Accounts for VA splits.');
+                if (cost === 0 && sale > 0) zeroCost.push({ n: o.orderNo || d.id, sale });
+                s += sale; c += cost; f2 += fee;
+                if (o.team === 'panacea') pan += sale - fee - cost;
+                else if (o.team === 'samayy') sam += sale - fee - cost;
+            });
+            const srcFee = (c + refundLoss) * pct / 100;
+            animateValue($('totalSales'), s);
+            animateValue($('netProfit'), s - f2 - c - refundLoss - srcFee - expAll);
+            animateValue($('totalOnBuyFees'), f2);
+            notes.push('Live totals across ALL orders in range — cancelled excluded, refunded counted as sourcing-cost loss.');
+            if (cancelN > 0) notes.push(`⚠️ <b>${cancelN}</b> cancelled order(s) had <b>${fmt(cancelFees)}</b> OnBuy fees on record — potential loss, needs OnBuy API confirmation (NOT counted in profit).`);
+            if (refundN > 0) notes.push(`↩️ <b>${refundN}</b> refunded order(s) counted as −${fmt(refundLoss)} sourcing-cost loss.`);
+            if (zeroCost.length) {
+                const zSum = zeroCost.reduce((a, z) => a + z.sale, 0);
+                const zNames = zeroCost.slice(0, 15).map(z => z.n).join(', ');
+                notes.push(`🚨 <b>${zeroCost.length}</b> order(s) in this range have <b>£0 sourcing cost</b> — profit inflated by up to <b>${fmt(zSum)}</b>. Orders: <b>${zNames}</b>${zeroCost.length > 15 ? ` …and ${zeroCost.length - 15} more` : ''}. Check these against your sheet — either the cost never landed, or it's a refunded/loss row still marked dispatched.`);
             }
+            if (pct > 0 || expAll > 0) notes.push(`Net Profit is after deductions — sourcing fee ${pct}% (−${fmt(srcFee)})${expAll > 0 ? ` and expenses (−${fmt(expAll)})` : ''}.`);
+            // --- VA splits (uses the % in the input boxes; shows the selected account's split too) ---
+            const panPct = (parseFloat($('panaceaPercent').value) || 30) / 100;
+            const samPct = (parseFloat($('samayyPercent').value) || 20) / 100;
+            const fl = f.toLowerCase();
+            if (f === 'All Accounts' || fl === 'panacea') animateValue($('panaceaSplit'), pan * panPct);
+            else $('panaceaSplit').textContent = '—';
+            if (f === 'All Accounts' || fl === 'samayy') animateValue($('samayySplit'), sam * samPct);
+            else $('samayySplit').textContent = '—';
             // --- refund & cancel rate (#11) — same scope (account + date) as totals ---
             try {
                 const totAgg = await getAggregateFromServer(query(collection(db, "orderTracker_orders"), ...wh), { n: count() });
@@ -2166,6 +2274,7 @@
         window.openDispatch = function(id) {
             dispatchOrderId = id; selectedCourier = '';
             $('trackingInput').value = '';
+            $('supplierOrderInput').value = '';
             document.querySelectorAll('#dispatchModal .courier').forEach(b => b.classList.remove('sel'));
             $('dispatchModal').classList.remove('hidden');
             setTimeout(() => $('trackingInput').focus(), 150);
@@ -2180,9 +2289,11 @@
             const tracking = $('trackingInput').value.trim();
             if (!tracking) return toast('Enter the tracking number.', 'error');
             try {
+                const supplierNo = $('supplierOrderInput').value.trim();
                 await updateDoc(doc(db, "orderTracker_orders", dispatchOrderId), {
                     status: 'Dispatched', dispatchedToOnbuy: true,
                     trackingCarrier: selectedCourier, trackingNumber: tracking,
+                    ...(supplierNo ? { sourceOrderNo: supplierNo } : {}),
                     dispatchedAt: serverTimestamp()
                 });
                 closeModal('dispatchModal');
@@ -2421,6 +2532,7 @@ async function saveSplitPercentages(){
             const lockIc = isEnc ? `<span class="lock-ic" title="Stored encrypted (AES-256)">🔒</span>` : '';
             const pBadge = l.sourcePlatform ? platformBadge(l.sourcePlatform) : '';
             const onbuyHref = l.onbuyUrl ? String(l.onbuyUrl)
+                : l.onbuyProductId ? `https://www.onbuy.com/gb/p/x~p${encodeURIComponent(String(l.onbuyProductId).trim())}/`
                 : l.opc ? `https://www.onbuy.com/gb/search/?q=${encodeURIComponent(String(l.opc).trim())}`
                 : `https://www.onbuy.com/gb/search/?q=${encodeURIComponent(String(l.sku || '').trim())}`;
 
@@ -2443,10 +2555,13 @@ async function saveSplitPercentages(){
                 <td>${stockHtml}</td>
                 <td>${bbHtml}</td>
                 <td><input type="text" id="link-${d.id}" class="inp" value="${esc(l._plainLink || '')}" placeholder="Paste link…">
-                    <div class="small" style="margin-top:4px">${lockIc} ${pBadge}</div></td>
+                    <div class="small" style="margin-top:4px">${lockIc} ${pBadge}</div>
+                    <input type="number" id="price-${d.id}" class="inp" min="0" step="0.01" value="${l.sourcePrice != null ? l.sourcePrice : ''}" placeholder="Source price £" style="margin-top:6px">
+                    ${l._plainLink ? `<a href="${esc(l._plainLink)}" target="_blank" class="btn btn-soft btn-sm" style="margin-top:6px" title="Open the buying page (Amazon/eBay)">Open Source ↗</a>` : ''}
+                    <div class="small muted src-stamp" style="margin-top:4px">${l.sourceCheckedAt ? '⏱ ' + relTime(l.sourceCheckedAt.toDate ? l.sourceCheckedAt.toDate() : new Date(l.sourceCheckedAt)) + (l.sourceCheckMethod === 'manual' ? ' · manual ✋' : ' · auto') + (l.sourceCheckedBy ? ' · ' + esc(l.sourceCheckedBy) : '') : 'Never price-checked'}</div></td>
                 <td>
-                    <button onclick="saveSourcingLink('${d.id}', document.getElementById('link-${d.id}').value)" class="btn btn-primary btn-sm" style="margin-bottom:6px">Save Link</button>
-                    <a href="${esc(onbuyHref)}" target="_blank" class="btn btn-dark btn-sm" style="margin-bottom:6px">OnBuy ↗</a><br>
+                    <button onclick="saveListingSource('${d.id}')" class="btn btn-primary btn-sm" style="margin-bottom:6px" title="Saves link + price together — no page refresh">Save</button>
+                    <a href="${esc(onbuyHref)}" target="_blank" class="btn btn-dark btn-sm" style="margin-bottom:6px" title="Find this exact listing on OnBuy (searches by OPC)">OnBuy ↗</a><br>
                     ${flagBtn}
                 </td>
             </tr>`;
@@ -2470,6 +2585,75 @@ async function saveSplitPercentages(){
                 toast(cleaned.platform && cleaned.platform !== 'Other'
                     ? `Saved — ${cleaned.platform} link cleaned & encrypted 🔒`
                     : 'Sourcing link saved & encrypted 🔒', 'success');
+            } catch (e) { toast('Save failed: ' + e.message, 'error'); }
+        };
+
+        /* ================= LISTING SOURCE PRICE (manual entry — zero API cost) ================= */
+        window.saveListingPrice = async function(id) {
+            const v = parseFloat($(`price-${id}`).value);
+            if (!v || v <= 0) return toast('Enter the source price first (e.g. 12.99).', 'error');
+            try {
+                const l = listingCache[id] || {};
+                const fields = {
+                    sourcePrice: v,
+                    sourceCheckedAt: serverTimestamp(),
+                    sourceCheckedBy: roleLabel(currentRole),
+                    sourceCheckMethod: 'manual',
+                    checkTier: 'B',
+                    lastPriceChange: null,
+                    consecutiveNoChange: 0
+                };
+                if (l._plainLink) fields.sourceUrl = l._plainLink;   // puts the listing into the scheduled checker's pool (re-checks after 24h, not before)
+                await updateDoc(doc(db, "orderTracker_listings", id), fields);
+                if (listingCache[id]) { listingCache[id].sourcePrice = v; listingCache[id].sourceCheckMethod = 'manual'; listingCache[id].sourceCheckedBy = roleLabel(currentRole); }
+                toast('Source price saved & time-stamped — no API call needed for 24h+. 💷', 'success');
+                reloadCurrentListings();
+            } catch (e) { toast('Save failed: ' + e.message, 'error'); }
+        };
+
+        /* ================= LISTING SOURCE: ONE-CLICK SAVE (link + price, no page refresh) ================= */
+        window.saveListingSource = async function(id) {
+            const rawLink = ($(`link-${id}`).value || '').trim();
+            const priceV = parseFloat($(`price-${id}`).value);
+            if (!rawLink && !(priceV > 0)) return toast('Paste a link and/or enter a price first.', 'info');
+            try {
+                const cleaned = rawLink ? cleanSourceUrl(rawLink) : { cleanUrl: '', platform: '' };
+                const encLink = cleaned.cleanUrl ? await encryptText(cleaned.cleanUrl) : '';
+                if (encLink.startsWith(ENC_PREFIX)) decCache.set(encLink, cleaned.cleanUrl);
+                const fields = {
+                    sourceLink: encLink,
+                    sourcePlatform: cleaned.platform || '',
+                    linkUpdatedAt: serverTimestamp(),
+                    sourceUrl: cleaned.cleanUrl || ''        // plain copy for the scheduled checker's pool
+                };
+                if (priceV > 0) {
+                    fields.sourcePrice = priceV;
+                    fields.sourceCheckedAt = serverTimestamp();
+                    fields.sourceCheckedBy = roleLabel(currentRole);
+                    fields.sourceCheckMethod = 'manual';
+                    fields.checkTier = 'B';
+                    fields.lastPriceChange = null;
+                    fields.consecutiveNoChange = 0;
+                }
+                await updateDoc(doc(db, "orderTracker_listings", id), fields);
+                if (listingCache[id]) Object.assign(listingCache[id], {
+                    sourceLink: encLink, _plainLink: cleaned.cleanUrl, sourcePlatform: cleaned.platform,
+                    ...(priceV > 0 ? { sourcePrice: priceV, sourceCheckMethod: 'manual', sourceCheckedBy: roleLabel(currentRole) } : {})
+                });
+                // in-place row update — no reload, scroll position kept
+                const row = document.querySelector(`tr[data-id="${id}"]`);
+                if (row) {
+                    const linkInp = row.querySelector(`#link-${CSS.escape(id)}`);
+                    if (linkInp) linkInp.value = cleaned.cleanUrl;
+                    const info = row.querySelectorAll('td')[4];
+                    if (info && priceV > 0) {
+                        const stamp = info.querySelector('.src-stamp');
+                        if (stamp) stamp.textContent = '⏱ just now · manual ✋ · ' + roleLabel(currentRole);
+                    }
+                }
+                toast(priceV > 0
+                    ? `Link + £${priceV.toFixed(2)} saved — scraper skips this for 24h+. 💷`
+                    : 'Link saved & encrypted 🔒', 'success');
             } catch (e) { toast('Save failed: ' + e.message, 'error'); }
         };
 
@@ -3072,9 +3256,10 @@ Thank you for your patience, and apologies again for the trouble.`
             }
 
             tbody.innerHTML = list.map(d => {
-                const date = d.receivedAt ? new Date(d.receivedAt).toLocaleDateString('en-GB') : '—';
+                const date = d.receivedAt ? (d.receivedAt.toDate ? d.receivedAt.toDate().toLocaleDateString('en-GB') : new Date(d.receivedAt).toLocaleDateString('en-GB')) : '—';
                 const fee = d.feeAmount ? `£${d.feeAmount.toFixed(2)}` : '—';
-                const typeClass = getDisputeTypeClass(d.reason || 'Other');
+                const typeDisplay = d.type || d.reason || 'Other';
+                const typeClass = getDisputeTypeClass(typeDisplay);
                 const urgencyClass = getDisputeUrgencyClass(d.priority || d.priority || 'Normal');
                 const isUrgent = (d.priority || d.priority || 'Normal') === 'High';
                 const statusBadge = d.status === 'Open' ? 'badge-danger'
@@ -3086,7 +3271,7 @@ Thank you for your patience, and apologies again for the trouble.`
                     <td class="small">${date}</td>
                     <td><strong class="mono">${esc(d.orderId || '—')}</strong></td>
                     <td class="small">${esc(d.disputeRef || '—')}</td>
-                    <td><span class="badge ${typeClass}">${esc(d.reason || 'Other')}</span></td>
+                    <td><span class="badge ${typeClass}">${esc(typeDisplay)}</span></td>
                     <td class="small" style="max-width:200px">${esc(d.reason || '—')}</td>
                     <td style="font-weight:800;color:var(--red)">${fee}</td>
                     <td><span class="badge ${urgencyClass}">${esc(d.priority || d.priority || 'Normal')}</span></td>
@@ -3101,13 +3286,18 @@ Thank you for your patience, and apologies again for the trouble.`
 
         // Firestore listener (real-time updates for ALL users — VAs see their account's disputes)
         function watchDisputes() {
+            let prevCount = 0;
             onSnapshot(query(collection(db, "orderTracker_disputes"), orderBy("receivedAt", "desc"), limit(100)), snap => {
-                disputes = [];
-                snap.forEach(d => disputes.push({ id: d.id, ...d.data() }));
-                // For VAs: always re-render from Firestore (they use client-side filtering)
-                // For Admin: only re-render if no API filters are active
+                const newDisputes = [];
+                snap.forEach(d => newDisputes.push({ id: d.id, ...d.data() }));
+                const openCount = newDisputes.filter(d => d.status === 'Open' || !d.status).length;
+                if (prevCount > 0 && openCount > prevCount && $('disputesTab').classList.contains('hidden')) {
+                    toast(`📧 ${openCount - prevCount} new dispute(s) arrived! Click Disputes tab to view.`, 'info');
+                }
+                prevCount = openCount;
+                disputes = newDisputes;
                 if (!isAdmin()) {
-                    loadDisputesFromApi(); // triggers client-side filter path
+                    loadDisputesFromApi();
                 } else if (!$('disputeFilterStatus').value && !$('disputeFilterType').value && !$('disputeFilterUrgency').value && !$('disputeSearch').value) {
                     renderDisputesV2(disputes);
                 }
@@ -3123,17 +3313,17 @@ Thank you for your patience, and apologies again for the trouble.`
             currentDisputeId = id;
 
             $('ddTitle').textContent = `Dispute ${esc(d.disputeRef || d.orderId || 'Detail')}`;
-            $('ddSub').textContent = `From: ${esc(d.from || 'OnBuy Support')} · Type: ${esc(d.reason || 'Other')}`;
+            $('ddSub').textContent = `From: ${esc(d.from || 'OnBuy Support')} · Type: ${esc(d.reason || 'Other')} · Account: ${esc(d.account || d.team || 'N/A')}`;
             $('ddOrderId').textContent = d.orderId || '—';
             $('ddDisputeRef').textContent = d.disputeRef || '—';
-            $('ddType').textContent = d.reason || 'Other';
+            $('ddType').textContent = d.type || d.reason || 'Other';
             $('ddUrgency').textContent = d.priority || d.priority || 'Normal';
             $('ddFee').textContent = d.feeAmount ? `£${d.feeAmount.toFixed(2)}` : '—';
-            $('ddReceived').textContent = d.receivedAt ? new Date(d.receivedAt).toLocaleString('en-GB') : '—';
-            $('ddSubject').textContent = d.subject || '—';
+            $('ddReceived').textContent = d.receivedAt ? (d.receivedAt.toDate ? d.receivedAt.toDate().toLocaleString('en-GB') : new Date(d.receivedAt).toLocaleString('en-GB')) : '—';
+            $('ddSubject').textContent = d.rawSubject || d.subject || '—';
             $('ddReason').textContent = d.reason || '—';
             $('ddOutcome').textContent = d.outcome || '—';
-            $('ddRaw').textContent = d.rawBody || d.rawBody || 'No raw text saved.';
+            $('ddRaw').textContent = d.rawBody || d.rawText || 'No raw text saved.';
             $('ddReplyDraft').value = d.replyDraft || '';
             $('ddNotes').value = d.notes || '';
             $('ddStatusSelect').value = d.status || 'Open';
@@ -3437,7 +3627,8 @@ Best regards,
                     <td style="font-weight:800">${fmt(Number(l.price) || 0)}</td>
                     <td>${link
                         ? `<a href="${esc(link)}" target="_blank" class="btn btn-soft btn-sm">Open Source ↗</a> ${platformBadge(l.sourcePlatform)}`
-                        : `<div style="display:flex;gap:6px"><input type="text" id="batch-link-${d.id}" class="inp" placeholder="No source — paste one…"><button onclick="saveBatchSource('${d.id}')" class="btn btn-primary btn-sm" style="flex:none">Save</button></div>`}</td>
+                        : `<div style="display:flex;gap:6px"><input type="text" id="batch-link-${d.id}" class="inp" placeholder="No source — paste one…"><button onclick="saveBatchSource('${d.id}')" class="btn btn-primary btn-sm" style="flex:none">Save</button></div>`}
+                        <div style="display:flex;gap:6px;margin-top:6px"><input type="number" id="batch-price-${d.id}" class="inp" min="0" step="0.01" value="${l.sourcePrice != null ? l.sourcePrice : ''}" placeholder="£ price" style="width:96px;flex:none" title="Price you see on the source page right now"><button onclick="saveBatchPrice('${d.id}')" class="btn btn-success btn-sm" style="flex:none" title="Manual entry — stamps the time so the scraper skips this listing (saves an API call)">Save £</button></div></td>
                     <td class="small muted">${last ? relTime(last) : 'Never checked'}${l.deadCheckCount ? `<br>${l.deadCheckCount}× checked` : ''}</td>
                     <td>
                         <button onclick="markStillDead('${d.id}')" class="btn btn-ghost btn-sm">Still Dead</button>
@@ -3475,6 +3666,31 @@ Best regards,
                 await bumpPerf('sourcesFound');
                 renderBatch(); loadPerf();
                 toast(`Source saved & encrypted 🔒 (${cleaned.platform})`, 'success');
+            } catch (e) { toast('Save failed: ' + e.message, 'error'); }
+        };
+        /* ================= BATCH SOURCE PRICE (manual entry — zero API cost) ================= */
+        window.saveBatchPrice = async function(id) {
+            const v = parseFloat($(`batch-price-${id}`).value);
+            if (!v || v <= 0) return toast('Enter the price you see on the source page (e.g. 12.99).', 'error');
+            try {
+                const l = listingCache[id] || {};
+                const fields = {
+                    sourcePrice: v,
+                    sourceCheckedAt: serverTimestamp(),
+                    sourceCheckedBy: roleLabel(currentRole),
+                    sourceCheckMethod: 'manual',
+                    checkTier: 'B',
+                    lastPriceChange: null,
+                    consecutiveNoChange: 0,
+                    lastDeadCheck: serverTimestamp(),
+                    deadCheckCount: increment(1)
+                };
+                if (l._plainLink) fields.sourceUrl = l._plainLink;   // puts the listing into the scheduled checker's pool (re-checks after 24h, not before)
+                await updateDoc(doc(db, "orderTracker_listings", id), fields);
+                if (listingCache[id]) { listingCache[id].sourcePrice = v; listingCache[id].sourceCheckMethod = 'manual'; }
+                await bumpPerf('listingsChecked');
+                loadPerf();
+                toast('Price saved & time-stamped — scraper skips this one for 24h+. 💷', 'success');
             } catch (e) { toast('Save failed: ' + e.message, 'error'); }
         };
         window.openRestock = function(id) {
@@ -3758,6 +3974,9 @@ Best regards,
             snap.forEach(d => {
                 const o = d.data();
                 if (!saaInScope(scope, o)) return;
+                const st = orderState(o);
+                if (st === 'cancelled') return;                                       // no money moved — excluded
+                if (st === 'refunded') { n++; profit -= (Number(o.amount) || 0); return; }  // sale reversed — sourcing cost lost
                 const sale = Number(o.sellingPrice) || 0;
                 n++; sales += sale;
                 profit += sale - (Number(o.onbuyFee) || 0) - (Number(o.amount) || 0);
@@ -3777,7 +3996,11 @@ Best regards,
                 const o = d.data();
                 if (!saaInScope(scope, o)) return;
                 const name = String(o.item || 'Unknown item').trim() || 'Unknown item';
-                const p = (Number(o.sellingPrice) || 0) - (Number(o.onbuyFee) || 0) - (Number(o.amount) || 0);
+                const st = orderState(o);
+                if (st === 'cancelled') return;                                       // no money moved — excluded
+                const p = st === 'refunded'
+                    ? -(Number(o.amount) || 0)                                        // sale reversed — sourcing cost lost
+                    : (Number(o.sellingPrice) || 0) - (Number(o.onbuyFee) || 0) - (Number(o.amount) || 0);
                 (items[name] = items[name] || { profit: 0, qty: 0 });
                 items[name].profit += p; items[name].qty += (Number(o.qty) || 1);
             });
@@ -4044,7 +4267,6 @@ window.saaBoot = function() {
     </div>
 </body>
 </html>
-
 
 
 
