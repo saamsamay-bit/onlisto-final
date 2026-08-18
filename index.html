@@ -1735,6 +1735,13 @@
             loadSplitPercentages();
             patchMissingTeamFields();
             $('insMonth').value = todayStr().slice(0, 7);   // Hero Products defaults to the current month
+            // Default P&L view = current month (18 Aug 2026): 1st -> today, shown in the date boxes.
+            const _nw = new Date();
+            const _msIso = `${_nw.getFullYear()}-${String(_nw.getMonth() + 1).padStart(2, '0')}-01`;
+            $('dateFrom').value = _msIso;
+            $('dateTo').value = todayStr();
+            window._dateFrom = Timestamp.fromDate(new Date(_msIso + 'T00:00:00'));
+            window._dateTo = Timestamp.fromDate(new Date(todayStr() + 'T23:59:59'));
             fetchOrders();
             fetchCatalogHealth();
             watchBanned();
