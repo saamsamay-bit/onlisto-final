@@ -392,7 +392,10 @@ async function sweepStaleActive(account, token, execute) {
     r.checked++;
     try {
       const json = await onbuyGet(token, `/orders/${encodeURIComponent(oid)}?site_id=2000`);
-      const o = json.order || (Array.isArray(json.results) && json.results[0]) || (Array.isArray(json.data) && json.data[0]) || null;
+      const o = json.order
+        || (Array.isArray(json.results) ? json.results[0] : (json.results && typeof json.results === 'object' ? json.results : null))
+        || (Array.isArray(json.data) && json.data[0])
+        || null;
       if (!o) { r.notFoundOnOnBuy++; continue; }
       const s = String(o.status || '').toLowerCase();
       if (s.includes('awaiting')) { r.stillAwaiting++; continue; }
