@@ -597,6 +597,19 @@
         </div>
     </div>
 
+    <!-- ================= SUPPLIER AUDIT MODAL (18 Aug 2026) ================= -->
+    <div id="auditModal" class="modal-overlay hidden">
+        <div class="modal" style="max-width:720px">
+            <h3>🔍 Supplier Order Audit</h3>
+            <p class="small muted">Cross-checks dashboard orders against Amazon / AliExpress / eBay confirmation emails in orders@onlisto.io.</p>
+            <div id="auditSummary" style="margin:10px 0"></div>
+            <div id="auditLists" style="max-height:420px;overflow:auto"></div>
+            <div class="btn-row" style="margin-top:12px">
+                <button class="btn btn-ghost" onclick="closeModal('auditModal')">Close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- ================= ADD DISPUTE MODAL ================= -->
     <div id="addDisputeModal" class="modal-overlay hidden">
         <div class="modal">
@@ -1040,6 +1053,7 @@
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_cancelled" onclick="setOrderView('cancelled')">Cancelled</button>
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_refunded" onclick="setOrderView('refunded')">Refunded</button>
                     <span id="cancelStats" style="display:inline-flex;gap:6px;flex-wrap:wrap"></span>
+                    <button class="btn btn-ghost btn-sm" onclick="runSupplierAudit()" title="Cross-check supplier order numbers vs Amazon / AliExpress / eBay confirmation emails">🔍 Audit</button>
                     <input type="text" id="orderSearchInput" class="inp" placeholder="Search order ID…" style="width:180px;margin-left:auto" onkeydown="if(event.key==='Enter')searchOrders()">
                     <button class="btn btn-primary btn-sm" onclick="searchOrders()">Search</button>
                     <button class="btn btn-ghost btn-sm" onclick="clearOrderSearch()">Clear</button>
@@ -1882,6 +1896,38 @@
                 closeModal('cancelReasonModal');
                 toast(window._cancelReasonConfirm ? 'Cancellation confirmed with reason.' : 'Cancellation reason saved.', 'success');
             } catch (e) { toast('Save failed: ' + e.message, 'error'); }
+        };
+
+        /* ================= SUPPLIER AUDIT (18 Aug 2026) ================= */
+        window.runSupplierAudit = async function() {
+            $('auditSummary').innerHTML = '<span class="muted">Running audit — scanning every order and every supplier email…</span>';
+            $('auditLists').innerHTML = '';
+            $('auditModal').classList.remove('hidden');
+            try {
+                const res = await fetch(`${API_BASE}/auditSupplierOrders?key=Katimatitati99@`);
+                const d = await res.json();
+                if (!d.success) throw new Error(d.error || 'audit failed');
+                const c = d.counts;
+                $('auditSummary').innerHTML = `<span class="attn-strip">
+                    <span class="attn-chip attn-grey">📦 ${c.ordersScanned} orders</span>
+                    <span class="attn-chip attn-grey">✉️ ${c.emailsScanned} emails</span>
+                    <span class="attn-chip attn-grey">✅ ${c.matched} matched</span>
+                    ${c.missingEmail ? `<span class="attn-chip attn-red">🚨 ${c.missingEmail} no email proof</span>` : ''}
+                    ${c.noSourceNo ? `<span class="attn-chip attn-amber">⚠️ ${c.noSourceNo} no source no.</span>` : ''}
+                    ${c.extraEmails ? `<span class="attn-chip attn-amber">❓ ${c.extraEmails} mystery emails</span>` : ''}
+                </span>`;
+                const row = (x, extra) => `<div style="padding:6px 8px;border-bottom:1px solid var(--border,#333)">
+                    <b>${esc(x.orderNo || x.supplierOrderNo || '')}</b> <span class="small muted">${esc(x.account || x.platform || '')}</span>
+                    ${x.supplierOrderNo ? `<span class="small"> · supplier: ${esc(x.supplierOrderNo)}</span>` : ''}
+                    <div class="small muted">${esc(x.item || x.subject || '')}${extra || ''}</div></div>`;
+                let h = '';
+                if (d.missingEmail.length) h += `<h4 style="color:#f66">🚨 Orders with NO confirmation email (maybe never placed)</h4>` + d.missingEmail.map(x => row(x)).join('');
+                if (d.noSourceNo.length) h += `<h4 style="color:#fa0">⚠️ Live orders with no supplier order number recorded</h4>` + d.noSourceNo.map(x => row(x)).join('');
+                if (d.extraEmails.length) h += `<h4 style="color:#fa0">❓ Emails with no matching dashboard order (mystery purchases)</h4>` + d.extraEmails.map(x => row(x, x.totalPaid != null ? ` · paid £${x.totalPaid}` : '')).join('');
+                $('auditLists').innerHTML = h || '<div class="muted" style="padding:12px">Perfect — every live order matches a confirmation email.</div>';
+            } catch (e) {
+                $('auditSummary').innerHTML = `<span style="color:#f66">Audit failed: ${esc(e.message)}</span>`;
+            }
         };
         document.querySelectorAll('.modal-overlay').forEach(m =>
             m.addEventListener('click', e => { if (e.target === m) m.classList.add('hidden'); }));

@@ -2695,3 +2695,193 @@ exports.refreshOrderStatuses = onRequest(
     });
   }
 );
+
+// ============================================================================
+// SUPPLIER EMAIL READER (18 Aug 2026) — Amazon / AliExpress / eBay order
+// confirmations land in orders@onlisto.io, get parsed into
+// orderTracker_supplierEmails, and the audit engine cross-checks them against
+// orderTracker_orders.sourceOrderNo. Catches: orders never placed (no email)
+// and mystery purchases (email with no dashboard order).
+// Password lives in functions/.env as SUPPLIER_EMAIL_PASSWORD (never deploys
+// to cloud as a file — set it via Cloud Run env like the dispute one).
+// ============================================================================
+function parseSupplierEmail(subject, text, html, messageId) {
+  const body = text || html || '';
+  const s = String(subject || '');
+  const b = String(body);
+  const r = {
+    platform: '', supplierOrderNo: '', itemTitle: '', totalPaid: null,
+    currency: 'GBP', orderDate: '', messageId: messageId || '',
+    rawSubject: s, rawBody: b.slice(0, 4000),
+    receivedAt: new Date().toISOString(),
+  };
+  const low = (s + ' ' + b.slice(0, 800)).toLowerCase();
+  if (low.includes('aliexpress')) r.platform = 'AliExpress';
+  else if (low.includes('amazon')) r.platform = 'Amazon';
+  else if (low.includes('ebay')) r.platform = 'eBay';
+
+  const pats = [
+    ['Amazon', /Order\s*#\s*(\d{3}-\d{7}-\d{7})/i],
+    ['Amazon', /(\d{3}-\d{7}-\d{7})/],
+    ['AliExpress', /Order\s*(?:No\.?|ID|Number)[:\s#]*(\d{13,18})/i],
+    ['AliExpress', /\b(\d{16,18})\b/],
+    ['eBay', /Order\s*(?:number|No\.?|ID)[:\s#]*(\d{2}-\d{5}-\d{5})/i],
+    ['eBay', /\b(\d{2}-\d{5}-\d{5})\b/],
+  ];
+  for (const [plat, re] of pats) {
+    const m = b.match(re) || s.match(re);
+    if (m) { r.supplierOrderNo = m[1]; if (!r.platform) r.platform = plat; break; }
+  }
+  if (!r.platform && r.supplierOrderNo) r.platform = 'Other';
+
+  const tm = b.match(/Order\s*Total[:\s]*\u00a3?([\d,]+\.?\d{0,2})/i)
+          || b.match(/Grand\s*Total[:\s]*\u00a3?([\d,]+\.?\d{0,2})/i)
+          || b.match(/Total[:\s]*\u00a3([\d,]+\.?\d{0,2})/);
+  if (tm) r.totalPaid = parseFloat(tm[1].replace(/,/g, ''));
+
+  const tmTitle = s.match(/order\s+(?:of|for)\s+\u201c?([^\u201d\n]{5,120})/i)
+               || s.match(/\u201c([^\u201d]{5,120})\u201d/);
+  if (tmTitle) r.itemTitle = tmTitle[1].trim();
+  return r;
+}
+
+async function readSupplierEmailsViaImap() {
+  const host = process.env.IMAP_HOST || 'mail.onlisto.io';
+  const port = Number(process.env.IMAP_PORT || 993);
+  const user = process.env.SUPPLIER_EMAIL_USER || 'orders@onlisto.io';
+  const password = process.env.SUPPLIER_EMAIL_PASSWORD || '';
+  if (!password) {
+    logger.error('SUPPLIER_EMAIL_PASSWORD not set');
+    return { error: 'SUPPLIER_EMAIL_PASSWORD not set' };
+  }
+  const imap = new Imap({ host, port, user, password, tls: true, tlsOptions: { rejectUnauthorized: false } });
+  await new Promise((resolve, reject) => {
+    imap.once('ready', resolve);
+    imap.once('error', reject);
+    imap.connect();
+  });
+  try {
+    await openImapBox(imap, 'INBOX');
+    const sinceDate = new Date();
+    sinceDate.setDate(sinceDate.getDate() - 7);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const sinceStr = `${String(sinceDate.getDate()).padStart(2,'0')}-${months[sinceDate.getMonth()]}-${sinceDate.getFullYear()}`;
+    const results = await searchImap(imap, [['SINCE', sinceStr]]);
+    logger.info(`Supplier IMAP: ${results.length} emails in last 7 days`);
+    if (!results.length) { imap.end(); return { processed: 0, found: 0 }; }
+
+    const msgs = await fetchImapMessages(imap, results, { bodies: '', markSeen: true });
+    let processed = 0, skippedUnparsable = 0, dupes = 0;
+    for (const buf of msgs) {
+      try {
+        const parsed = await simpleParser(buf);
+        const d = parseSupplierEmail(parsed.subject, parsed.text, parsed.html, parsed.messageId);
+        if (!d.supplierOrderNo) { skippedUnparsable++; continue; }
+        if (d.messageId) {
+          const ex = await db.collection('orderTracker_supplierEmails')
+            .where('messageId', '==', d.messageId).limit(1).get();
+          if (!ex.empty) { dupes++; continue; }
+        }
+        const docId = `${d.platform}_${d.supplierOrderNo}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+        await db.collection('orderTracker_supplierEmails').doc(docId).set(d, { merge: true });
+        processed++;
+        logger.info(`Supplier email saved: ${docId}`);
+      } catch (e) { logger.error(`Supplier IMAP parse error: ${e.message}`); }
+    }
+    imap.end();
+    return { processed, dupes, skippedUnparsable, found: results.length };
+  } catch (e) { imap.end(); throw e; }
+}
+
+exports.scheduledSupplierEmailReader = onSchedule(
+  { schedule: 'every 15 minutes', timeoutSeconds: 300, memory: '512MiB' },
+  async () => {
+    try {
+      const result = await readSupplierEmailsViaImap();
+      logger.info(`scheduledSupplierEmailReader done: ${JSON.stringify(result)}`);
+    } catch (e) { logger.error(`scheduledSupplierEmailReader error: ${e.message}`); }
+  }
+);
+
+// Manual test: /testSupplierImap?key=...
+exports.testSupplierImap = onRequest(
+  { timeoutSeconds: 60, memory: '256MiB' },
+  async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    try {
+      const result = await readSupplierEmailsViaImap();
+      res.json({ success: true, result });
+    } catch (e) {
+      logger.error(`testSupplierImap error: ${e.message}`);
+      res.status(500).json({ success: false, error: e.message });
+    }
+  }
+);
+
+// AUDIT (18 Aug 2026): cross-check dashboard orders vs supplier emails.
+//   /auditSupplierOrders?key=...
+// Returns three lists:
+//   missingEmail   — dashboard order HAS a supplier order no, but no matching
+//                    confirmation email (order maybe never actually placed)
+//   noSourceNo     — live dashboard order with NO supplier order no recorded
+//   extraEmails    — confirmation email with no matching dashboard order
+//                    (mystery purchase / typo'd source number)
+exports.auditSupplierOrders = onRequest(
+  { cors: true, timeoutSeconds: 300, memory: '1GiB' },
+  async (req, res) => {
+    if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
+    if (!checkAdminKey(req, res)) return;
+    try {
+      const emailSnap = await db.collection('orderTracker_supplierEmails').limit(2000).get();
+      const emailNos = new Map(); // supplierOrderNo -> {platform, receivedAt, totalPaid}
+      emailSnap.forEach(d => {
+        const e = d.data();
+        if (e.supplierOrderNo) emailNos.set(String(e.supplierOrderNo), {
+          platform: e.platform || '', receivedAt: e.receivedAt || '',
+          totalPaid: e.totalPaid ?? null, subject: e.rawSubject || '',
+        });
+      });
+
+      const orderSnap = await db.collection('orderTracker_orders').get();
+      const missingEmail = [], noSourceNo = [], matched = [];
+      const usedEmailNos = new Set();
+      orderSnap.forEach(d => {
+        const od = d.data();
+        const st = String(od.status || '');
+        const dead = st === 'Cancelled' || st === 'Refunded' || !!od.onbuyCancellation || !!od.onbuyRefunds;
+        const sno = String(od.sourceOrderNo || '').trim();
+        const base = {
+          id: d.id, orderNo: od.onbuyOrderId || od.orderNo || '', account: od.account || '',
+          item: String(od.item || '').slice(0, 80), status: st || od.onbuyStatus || '',
+        };
+        if (dead) return; // cancelled/refunded orders don't need supplier proof
+        if (!sno) { if (noSourceNo.length < 200) noSourceNo.push(base); return; }
+        if (emailNos.has(sno)) { usedEmailNos.add(sno); if (matched.length < 500) matched.push({ ...base, supplierOrderNo: sno }); }
+        else if (missingEmail.length < 200) missingEmail.push({ ...base, supplierOrderNo: sno });
+      });
+
+      const extraEmails = [];
+      for (const [no, e] of emailNos) {
+        if (!usedEmailNos.has(no) && extraEmails.length < 200) extraEmails.push({ supplierOrderNo: no, ...e });
+      }
+
+      res.json({
+        success: true,
+        generatedAt: new Date().toISOString(),
+        counts: {
+          ordersScanned: orderSnap.size,
+          emailsScanned: emailSnap.size,
+          matched: matched.length,
+          missingEmail: missingEmail.length,
+          noSourceNo: noSourceNo.length,
+          extraEmails: extraEmails.length,
+        },
+        missingEmail, noSourceNo, extraEmails,
+        matchedSample: matched.slice(0, 20),
+      });
+    } catch (e) {
+      logger.error(`auditSupplierOrders error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
