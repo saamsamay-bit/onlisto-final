@@ -121,6 +121,12 @@
         .kpi p{margin:0 0 4px;font-size:11.5px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
         .kpi h3{margin:0;font-size:25px;font-weight:900;letter-spacing:-.5px}
         .pnl-note{font-size:11.5px;color:var(--muted);margin:0 2px 20px;font-weight:600}
+        .attn-strip{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+        .attn-chip{display:inline-flex;align-items:center;gap:6px;padding:7px 13px;border-radius:999px;font-size:12px;font-weight:800;cursor:pointer;border:1px solid;transition:.18s}
+        .attn-chip:hover{transform:translateY(-1px)}
+        .attn-red{color:#b91c1c;background:#fef2f2;border-color:#fecaca}
+        .attn-amber{color:#92400e;background:#fffbeb;border-color:#fde68a}
+        .attn-grey{color:var(--muted);background:#f8fafc;border-color:var(--line);cursor:default}
 
         /* ---------- PANELS ---------- */
         .dashboard-layout{display:flex;gap:20px;align-items:flex-start}
@@ -549,6 +555,44 @@
             </div>
             <div class="modal-actions">
                 <button class="btn btn-ghost" onclick="closeModal('bannedModal')">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= ZERO-COST ORDERS MODAL (attention strip) ================= -->
+    <div id="zeroCostModal" class="modal-overlay hidden">
+        <div class="modal">
+            <h3>Orders with £0 sourcing cost</h3>
+            <div class="sub">Profit is inflated for these until the real cost is entered. Copy the list and check against your sheet.</div>
+            <div id="zeroCostList" style="max-height:50vh;overflow:auto;margin:12px 0;font-size:13px;line-height:1.9"></div>
+            <div class="modal-actions">
+                <button class="btn btn-soft" onclick="copyZeroCostList()">Copy list</button>
+                <button class="btn btn-ghost" onclick="closeModal('zeroCostModal')">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= CANCEL REASON MODAL (required) ================= -->
+    <div id="cancelReasonModal" class="modal-overlay hidden">
+        <div class="modal">
+            <h3>Cancellation reason</h3>
+            <div class="sub">Order <span id="cancelReasonOrderNo" class="mono"></span> — a reason is required so we can see WHY orders die.</div>
+            <label class="f" for="cancelReasonSel">Reason</label>
+            <select id="cancelReasonSel" onchange="cancelReasonSelChange()" style="width:100%">
+                <option value="">— choose a reason —</option>
+                <option value="price_high">Price too high / price difference</option>
+                <option value="out_of_stock">Out of stock at supplier</option>
+                <option value="not_found">Cannot find the product</option>
+                <option value="buyer_requested">Buyer requested cancellation</option>
+                <option value="other">Other (type below)</option>
+            </select>
+            <div id="cancelReasonOtherWrap" style="display:none;margin-top:10px">
+                <label class="f" for="cancelReasonNote">What happened?</label>
+                <textarea id="cancelReasonNote" class="inp" placeholder="e.g. Supplier doubled the price after listing"></textarea>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-primary" onclick="saveCancelReason()">Save reason</button>
+                <button class="btn btn-ghost" onclick="closeModal('cancelReasonModal')">Cancel</button>
             </div>
         </div>
     </div>
@@ -995,6 +1039,7 @@
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_dispatched" onclick="setOrderView('dispatched')">Dispatched</button>
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_cancelled" onclick="setOrderView('cancelled')">Cancelled</button>
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_refunded" onclick="setOrderView('refunded')">Refunded</button>
+                    <span id="cancelStats" style="display:inline-flex;gap:6px;flex-wrap:wrap"></span>
                     <input type="text" id="orderSearchInput" class="inp" placeholder="Search order ID…" style="width:180px;margin-left:auto" onkeydown="if(event.key==='Enter')searchOrders()">
                     <button class="btn btn-primary btn-sm" onclick="searchOrders()">Search</button>
                     <button class="btn btn-ghost btn-sm" onclick="clearOrderSearch()">Clear</button>
@@ -1610,9 +1655,13 @@
         function matchBanned(text) {
             const t = String(text || '').toLowerCase();
             if (!t) return null;
+            // Word-boundary match (18 Aug 2026): plain substring false-flagged
+            // innocent listings ("Bear" hit "teddy bear", "Parker" hit "Peter Parker").
             for (const b of bannedBrands) {
                 const n = String(b.brandName || '').toLowerCase().trim();
-                if (n && t.includes(n)) return b;
+                if (!n) continue;
+                const re = b._re || new RegExp('(^|[^a-z0-9])' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^a-z0-9]|$)');
+                if (re.test(t)) return b;
             }
             return null;
         }
@@ -1778,6 +1827,55 @@
 
         /* ================= MODALS ================= */
         window.closeModal = id => $(id).classList.add('hidden');
+
+        /* ================= ZERO-COST MODAL + CANCELLATION REASONS (18 Aug 2026) ================= */
+        window.openZeroCostModal = function() {
+            const list = window._zeroCostList || [];
+            $('zeroCostList').innerHTML = list.length
+                ? list.map(z => `<div><span class="mono">${esc(z.n)}</span> — ${fmt(z.sale)}</div>`).join('')
+                : '<div class="muted">No £0-cost orders in this range.</div>';
+            $('zeroCostModal').classList.remove('hidden');
+        };
+        window.copyZeroCostList = function() {
+            const list = window._zeroCostList || [];
+            navigator.clipboard.writeText(list.map(z => `${z.n}\t${z.sale}`).join('\n'))
+                .then(() => toast('Order list copied', 'success')).catch(() => toast('Copy failed', 'error'));
+        };
+        const CANCEL_REASON_LABELS = { price_high: 'Price too high', out_of_stock: 'Out of stock', not_found: 'Product not found', buyer_requested: 'Buyer requested', other: 'Other' };
+        window.openCancelReason = function(orderId, orderNo, alsoConfirm) {
+            window._cancelReasonOrderId = orderId;
+            window._cancelReasonConfirm = !!alsoConfirm;
+            $('cancelReasonOrderNo').textContent = orderNo || orderId;
+            $('cancelReasonSel').value = '';
+            $('cancelReasonNote').value = '';
+            $('cancelReasonOtherWrap').style.display = 'none';
+            $('cancelReasonModal').classList.remove('hidden');
+        };
+        window.cancelReasonSelChange = function() {
+            $('cancelReasonOtherWrap').style.display = $('cancelReasonSel').value === 'other' ? '' : 'none';
+        };
+        window.saveCancelReason = async function() {
+            const reason = $('cancelReasonSel').value;
+            const note = $('cancelReasonNote').value.trim();
+            if (!reason) return toast('Pick a reason first — it is required.', 'error');
+            if (reason === 'other' && !note) return toast('Type what happened for "Other".', 'error');
+            const updates = {
+                cancelReason: reason,
+                cancelReasonNote: note,
+                cancelledAt: serverTimestamp(),
+                cancelledBy: roleLabel(currentRole)
+            };
+            if (window._cancelReasonConfirm) {
+                updates.status = 'Cancelled';       // leaves the active list
+                updates.needsAttention = false;      // flag cleared — human has seen it
+                updates.attentionReason = '';
+            }
+            try {
+                await updateDoc(doc(db, "orderTracker_orders", window._cancelReasonOrderId), updates);
+                closeModal('cancelReasonModal');
+                toast(window._cancelReasonConfirm ? 'Cancellation confirmed with reason.' : 'Cancellation reason saved.', 'success');
+            } catch (e) { toast('Save failed: ' + e.message, 'error'); }
+        };
         document.querySelectorAll('.modal-overlay').forEach(m =>
             m.addEventListener('click', e => { if (e.target === m) m.classList.add('hidden'); }));
         document.addEventListener('keydown', e => { if (e.key === 'Escape') document.querySelectorAll('.modal-overlay').forEach(m => m.classList.add('hidden')); });
@@ -1935,6 +2033,17 @@
             const activeViewBtn = $('ov_' + window._orderView);
             if (activeViewBtn) activeViewBtn.classList.add('btn-primary');
 
+            // Cancel-reason summary chips (only in the Cancelled view)
+            const csEl = $('cancelStats');
+            if (csEl) {
+                if (window._orderView === 'cancelled') {
+                    const byReason = {};
+                    stateFiltered.forEach(o => { const k = o.cancelReason || 'needs_reason'; byReason[k] = (byReason[k] || 0) + 1; });
+                    csEl.innerHTML = Object.entries(byReason).map(([k, n]) =>
+                        `<span class="attn-chip ${k === 'needs_reason' ? 'attn-amber' : 'attn-grey'}" style="cursor:default">${k === 'needs_reason' ? '⚠️ reason needed' : esc(CANCEL_REASON_LABELS[k] || k)}: <b>${n}</b></span>`).join('');
+                } else csEl.innerHTML = '';
+            }
+
             let pending = 0;
             const rows = filtered.map(o => {
                 const isPan = o.team === 'panacea';
@@ -1950,7 +2059,13 @@
                 let statusHtml;
                 if (oState === 'cancelled') {
                     const cx = o.onbuyCancellation || {};
-                    statusHtml = `<span class="badge badge-danger">Cancelled</span><br>
+                    const confirmedCancel = o.status === 'Cancelled';
+                    const ono = esc(o.orderNo || o.onbuyOrderId || o.id);
+                    const reasonBadge = o.cancelReason
+                        ? `<span class="badge badge-neutral" title="${esc(o.cancelReasonNote || CANCEL_REASON_LABELS[o.cancelReason] || '')}">${esc(CANCEL_REASON_LABELS[o.cancelReason] || o.cancelReason)}</span>`
+                        : `<button class="btn btn-warning btn-sm" onclick="openCancelReason('${o.id}','${ono}',${confirmedCancel})">⚠️ Add reason</button>`;
+                    const confirmBtn = confirmedCancel ? '' : `<button class="btn btn-danger btn-sm" style="margin-left:6px" onclick="openCancelReason('${o.id}','${ono}',true)" title="Confirm this cancellation and record the reason">Confirm</button>`;
+                    statusHtml = `<span class="badge badge-danger">Cancelled</span> ${reasonBadge}${confirmBtn}<br>
                        <span class="small muted">${esc(cx.reason || cx.type || o.attentionReason || 'Cancelled on OnBuy')}</span><br>
                        <span class="small muted">${o.refundAt || o.cancelledAt ? fmtTs(o.cancelledAt || o.refundAt) : ''}</span>`;
                 } else if (oState === 'refunded') {
@@ -2191,15 +2306,21 @@
             animateValue($('totalSales'), s);
             animateValue($('netProfit'), s - f2 - c - refundLoss - srcFee - expAll);
             animateValue($('totalOnBuyFees'), f2);
-            notes.push('Live totals across ALL orders in range — cancelled excluded, refunded counted as sourcing-cost loss.');
-            if (cancelN > 0) notes.push(`⚠️ <b>${cancelN}</b> cancelled order(s) had <b>${fmt(cancelFees)}</b> OnBuy fees on record — potential loss, needs OnBuy API confirmation (NOT counted in profit).`);
-            if (refundN > 0) notes.push(`↩️ <b>${refundN}</b> refunded order(s) counted as −${fmt(refundLoss)} sourcing-cost loss.`);
+            // --- Attention strip (18 Aug 2026): chips replace the wall-of-text notes.
+            // One line per issue, severity-coloured, clickable — order numbers NEVER inline.
+            window._zeroCostList = zeroCost;
+            const infoNotes = notes.slice(); // date-filter line etc.
+            notes = [];
+            const chips = [];
             if (zeroCost.length) {
                 const zSum = zeroCost.reduce((a, z) => a + z.sale, 0);
-                const zNames = zeroCost.slice(0, 15).map(z => z.n).join(', ');
-                notes.push(`🚨 <b>${zeroCost.length}</b> order(s) in this range have <b>£0 sourcing cost</b> — profit inflated by up to <b>${fmt(zSum)}</b>. Orders: <b>${zNames}</b>${zeroCost.length > 15 ? ` …and ${zeroCost.length - 15} more` : ''}. Check these against your sheet — either the cost never landed, or it's a refunded/loss row still marked dispatched.`);
+                chips.push(`<span class="attn-chip attn-red" onclick="openZeroCostModal()" title="Click for the full order list">🚨 <b>${zeroCost.length}</b>&nbsp;orders · £0 cost · <b>${fmt(zSum)}</b>&nbsp;profit at risk</span>`);
             }
-            if (pct > 0 || expAll > 0) notes.push(`Net Profit is after deductions — sourcing fee ${pct}% (−${fmt(srcFee)})${expAll > 0 ? ` and expenses (−${fmt(expAll)})` : ''}.`);
+            if (cancelN > 0) chips.push(`<span class="attn-chip attn-amber" onclick="setOrderView('cancelled');document.getElementById('ordersTab').scrollIntoView({behavior:'smooth'})" title="Jump to the Cancelled view">⚠️ <b>${cancelN}</b>&nbsp;cancelled · <b>${fmt(cancelFees)}</b>&nbsp;fees to reclaim</span>`);
+            if (refundN > 0) chips.push(`<span class="attn-chip attn-amber" onclick="setOrderView('refunded');document.getElementById('ordersTab').scrollIntoView({behavior:'smooth'})" title="Jump to the Refunded view">↩️ <b>${refundN}</b>&nbsp;refunded · −${fmt(refundLoss)} sourcing loss</span>`);
+            const dedNote = (pct > 0 || expAll > 0) ? ` Net Profit is after sourcing fee ${pct}% (−${fmt(srcFee)})${expAll > 0 ? ` and expenses (−${fmt(expAll)})` : ''}.` : '';
+            chips.push(`<span class="attn-chip attn-grey" title="Live totals across ALL orders in range — cancelled excluded, refunded counted as sourcing-cost loss.${dedNote}">ℹ️ ${infoNotes.length ? esc(infoNotes.join(' ')) : 'All orders in range'} · how totals work</span>`);
+            notes.push(`<span class="attn-strip">${chips.join('')}</span>`);
             // --- VA splits (uses the % in the input boxes; shows the selected account's split too) ---
             const panPct = (parseFloat($('panaceaPercent').value) || 30) / 100;
             const samPct = (parseFloat($('samayyPercent').value) || 20) / 100;
@@ -2735,7 +2856,12 @@ async function saveSplitPercentages(){
         function watchBanned() {
             onSnapshot(query(collection(db, "orderTracker_bannedBrands"), orderBy("brandName")), snap => {
                 bannedBrands = [];
-                snap.forEach(d => bannedBrands.push({ id: d.id, ...d.data() }));
+                snap.forEach(d => {
+                    const bb = { id: d.id, ...d.data() };
+                    const nn = String(bb.brandName || '').toLowerCase().trim();
+                    bb._re = nn ? new RegExp('(^|[^a-z0-9])' + nn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^a-z0-9]|$)') : null;
+                    bannedBrands.push(bb);
+                });
                 $('bannedBtn').textContent = `Banned Brands (${bannedBrands.length})`;
                 renderBannedList();
                 renderOrders();
