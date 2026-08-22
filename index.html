@@ -1019,6 +1019,10 @@
                         <option value="monthly">Monthly</option>
                         <option value="once">One-off</option>
                     </select>
+                    <select id="expTeam" class="inp">
+                        <option value="panacea">Panacea</option>
+                        <option value="samayy">Samayy</option>
+                    </select>
                     <button class="btn btn-success btn-sm" onclick="addExpense()">+ Add Expense</button>
                 </div>
                 <div id="expList" class="exp-list"><div class="exp-empty">No expenses added yet — OnBuy subscriptions (£30 / £82.80 / £298.80 per account) are a good first one.</div></div>
@@ -2269,9 +2273,9 @@
             const [y1, m1] = fromMonth.split('-').map(Number), [y2, m2] = curMonth().split('-').map(Number);
             return Math.max(1, (y2 - y1) * 12 + (m2 - m1) + 1);
         }
-        const expensesAllTime = () => bizExpenses.reduce((t, e) =>
+        const expensesAllTime = team => bizExpenses.filter(e => !team || !e.team || e.team === team).reduce((t, e) =>
             t + (e.repeat === 'monthly' ? (Number(e.amount) || 0) * monthsActive(e.month) : (Number(e.amount) || 0)), 0);
-        const expensesThisMonth = () => bizExpenses.reduce((t, e) =>
+        const expensesThisMonth = team => bizExpenses.filter(e => !team || !e.team || e.team === team).reduce((t, e) =>
             t + (e.repeat === 'monthly' || e.month === curMonth() ? (Number(e.amount) || 0) : 0), 0);
 
         function watchExpenses() {
@@ -2284,19 +2288,22 @@
         }
         function renderExpenses() {
             const list = $('expList'); if (!list) return;
-            if (!bizExpenses.length) {
+            const acct = $('accountFilterDropdown').value.toLowerCase();
+            const visible = acct === 'all accounts' ? bizExpenses : bizExpenses.filter(e => !e.team || (e.team || '').toLowerCase() === acct);
+            if (!visible.length) {
                 list.innerHTML = '<div class="exp-empty">No expenses added yet — OnBuy subscriptions (£30 / £82.80 / £298.80 per account) are a good first one.</div>';
             } else {
-                list.innerHTML = bizExpenses.map(e => `<div class="exp-row">
+                list.innerHTML = visible.map(e => `<div class="exp-row">
                     <span class="exp-tag ${e.repeat === 'monthly' ? 'mo' : ''}">${e.repeat === 'monthly' ? 'Monthly' : 'One-off'}</span>
                     <b>${esc(e.name || 'Expense')}</b>
+                    <span class="badge badge-neutral">${esc(e.team || 'unassigned')}</span>
                     <span class="small muted">${esc(e.month || '')}${e.repeat === 'monthly' ? ' →' : ''}</span>
                     <span class="exp-amt">−${fmt(Number(e.amount) || 0)}${e.repeat === 'monthly' ? '/mo' : ''}</span>
                     <button class="exp-del" title="Remove" onclick="delExpense('${e.id}')">✕</button>
                 </div>`).join('');
             }
-            $('expTotal').innerHTML = bizExpenses.length
-                ? `This month: <b>−${fmt(expensesThisMonth())}</b> · All-time deducted: <b>−${fmt(expensesAllTime())}</b>`
+            $('expTotal').innerHTML = visible.length
+                ? `This month: <b>−${fmt(expensesThisMonth(acct === 'all accounts' ? null : acct))}</b> · All-time deducted: <b>−${fmt(expensesAllTime(acct === 'all accounts' ? null : acct))}</b>`
                 : '';
         }
         window.addExpense = async function() {
@@ -2306,7 +2313,7 @@
             if (!(amount > 0)) return toast('Enter a valid £ amount.', 'error');
             try {
                 await addDoc(collection(db, "orderTracker_expenses"), {
-                    name, amount, repeat: $('expRepeat').value, month: curMonth(),
+                    name, amount, repeat: $('expRepeat').value, month: curMonth(), team: $('expTeam').value,
                     createdAt: serverTimestamp(), createdBy: roleLabel(currentRole)
                 });
                 $('expName').value = ''; $('expAmount').value = '';
@@ -2333,7 +2340,8 @@
                 notes.push(`📅 Filtered: ${fd} → ${td}.`);
             }
             const pct = Number(bizSettings.sourcingPct) || 0;
-            const expAll = expensesAllTime();
+            const acct = f === 'All Accounts' ? null : f.toLowerCase();
+            const expAll = expensesAllTime(acct);
             // --- totals (state-aware: cancelled & refunded handled per agreed rules) ---
             // Paginated FULL scan of the selected scope (account + date range).
             // The old limit(5000) with no orderBy grabbed an arbitrary doc-ID
