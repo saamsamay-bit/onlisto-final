@@ -1846,6 +1846,7 @@
         window.onAccountFilterChange = function() {
             renderOrders();
             calculatePNL();
+            renderExpenses();
             fetchCatalogHealth();
             lastVisible = null; firstVisible = null; pageHistory = []; currentPage = 1;
             updateListingsHint();
@@ -2273,9 +2274,9 @@
             const [y1, m1] = fromMonth.split('-').map(Number), [y2, m2] = curMonth().split('-').map(Number);
             return Math.max(1, (y2 - y1) * 12 + (m2 - m1) + 1);
         }
-        const expensesAllTime = team => bizExpenses.filter(e => !team || !e.team || e.team === team).reduce((t, e) =>
+        const expensesAllTime = team => bizExpenses.filter(e => !team || !e.team || (e.team || '').toLowerCase() === team).reduce((t, e) =>
             t + (e.repeat === 'monthly' ? (Number(e.amount) || 0) * monthsActive(e.month) : (Number(e.amount) || 0)), 0);
-        const expensesThisMonth = team => bizExpenses.filter(e => !team || !e.team || e.team === team).reduce((t, e) =>
+        const expensesThisMonth = team => bizExpenses.filter(e => !team || !e.team || (e.team || '').toLowerCase() === team).reduce((t, e) =>
             t + (e.repeat === 'monthly' || e.month === curMonth() ? (Number(e.amount) || 0) : 0), 0);
 
         function watchExpenses() {
