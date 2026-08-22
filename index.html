@@ -2358,7 +2358,7 @@
                 pnlLast = pnlPage.docs[pnlPage.docs.length - 1];
             }
             let s = 0, c = 0, f2 = 0, refundLoss = 0, cancelFees = 0, cancelN = 0, refundN = 0, holdN = 0, heldSales = 0;
-            let pan = 0, sam = 0;
+            let pan = 0, sam = 0, panCostBasis = 0, samCostBasis = 0;
             const zeroCost = [];   // dispatched/active orders with no sourcing cost on record — profit inflated
             pnlDocs.forEach(d => {
                 const o = d.data();
@@ -2369,15 +2369,16 @@
                 if (st === 'cancelled') { cancelN++; cancelFees += fee; return; }   // no money moved — excluded; fee flagged below
                 if (st === 'refunded') {                                            // sale reversed; real loss = sourcing cost already paid
                     refundN++; refundLoss += cost;
-                    if (o.team === 'panacea') pan -= cost; else if (o.team === 'samayy') sam -= cost;
+                    if (o.team === 'panacea') { pan -= cost; panCostBasis += cost; }
+                    else if (o.team === 'samayy') { sam -= cost; samCostBasis += cost; }
                     return;
                 }
                 if (st === 'hold') { holdN++; heldSales += sale; return; }
                 if (st === 'pending') { return; }
                 if (cost === 0 && sale > 0) zeroCost.push({ n: o.orderNo || d.id, sale });
                 s += sale; c += cost; f2 += fee;
-                if (o.team === 'panacea') pan += sale - fee - cost;
-                else if (o.team === 'samayy') sam += sale - fee - cost;
+                if (o.team === 'panacea') { pan += sale - fee - cost; panCostBasis += cost; }
+                else if (o.team === 'samayy') { sam += sale - fee - cost; samCostBasis += cost; }
             });
             const srcFee = (c + refundLoss) * pct / 100;
             animateValue($('totalSales'), s);
@@ -2400,9 +2401,9 @@
             chips.push(`<span class="attn-chip attn-grey" title="Live totals across ALL orders in range — cancelled excluded, refunded counted as sourcing-cost loss.${dedNote}">ℹ️ ${infoNotes.length ? esc(infoNotes.join(' ')) : 'All orders in range'} · how totals work</span>`);
             notes.push(`<span class="attn-strip">${chips.join('')}</span>`);
             // --- VA splits (uses the % in the input boxes; shows the selected account's split too) ---
-            // Deduct each account's expenses before calculating the VA share.
-            pan -= expensesAllTime('panacea');
-            sam -= expensesAllTime('samayy');
+            // Deduct each account's sourcing fee and expenses before calculating the VA share.
+            pan -= (panCostBasis * pct / 100) + expensesAllTime('panacea');
+            sam -= (samCostBasis * pct / 100) + expensesAllTime('samayy');
             const panPct = (parseFloat($('panaceaPercent').value) || 30) / 100;
             const samPct = (parseFloat($('samayyPercent').value) || 20) / 100;
             const fl = f.toLowerCase();
