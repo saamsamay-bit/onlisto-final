@@ -467,6 +467,7 @@
         <div class="modal">
             <h3>Dispatch Order</h3>
             <div class="sub">Select the courier and enter the tracking number.</div>
+            <div id="dispatchCostWarning" class="small" style="color:var(--red);font-weight:700;display:none;margin-bottom:8px">⚠️ No sourcing cost set — profit will not count until cost is added.</div>
             <div class="courier-grid">
                 <button class="courier" data-c="Royal Mail" onclick="pickCourier(this)"><span class="c-dot" style="background:#e11d48"></span>Royal Mail</button>
                 <button class="courier" data-c="DPD" onclick="pickCourier(this)"><span class="c-dot" style="background:linear-gradient(135deg,#dc0032,#ffcd00)"></span>DPD</button>
@@ -2149,6 +2150,7 @@
                        <span class="small" style="font-weight:800;color:var(--ink)">${esc(o.trackingCarrier || '')}</span><br>
                        <span class="small muted mono">${esc(o.trackingNumber || '')}</span>` +
                        (o.sourceOrderNo ? `<br><span class="small muted" title="Supplier order number">🛒 ${esc(o.sourceOrderNo)}</span>` : '');
+                    if (Number(o.amount) <= 0) statusHtml += ` <span class="badge badge-warning" title="Enter sourcing cost to verify profit">⚠️ missing cost</span>`;
                 } else if (flagged) {
                     statusHtml = `<span class="badge badge-urgent"><span class="pulse"></span>Blocked</span><br>
                        <span class="small" style="color:var(--red);font-weight:700">Flagged: ${esc(bannedHit.brandName)}</span><br>` +
@@ -2359,6 +2361,7 @@
                 pnlLast = pnlPage.docs[pnlPage.docs.length - 1];
             }
             let s = 0, c = 0, f2 = 0, refundLoss = 0, cancelFees = 0, cancelN = 0, refundN = 0, holdN = 0, heldSales = 0;
+            let missingCostN = 0, missingCostSales = 0;
             let pan = 0, sam = 0, panCostBasis = 0, samCostBasis = 0;
             const zeroCost = [];   // dispatched/active orders with no sourcing cost on record — profit inflated
             pnlDocs.forEach(d => {
@@ -2376,6 +2379,7 @@
                 }
                 if (st === 'hold') { holdN++; heldSales += sale; return; }
                 if (st === 'pending') { return; }
+                if (st === 'dispatched' && cost <= 0) { missingCostN++; missingCostSales += sale; return; }
                 if (cost === 0 && sale > 0) zeroCost.push({ n: o.orderNo || d.id, sale });
                 s += sale; c += cost; f2 += fee;
                 if (o.team === 'panacea') { pan += sale - fee - cost; panCostBasis += cost; }
@@ -2398,6 +2402,9 @@
             if (cancelN > 0) chips.push(`<span class="attn-chip attn-amber" onclick="setOrderView('cancelled');document.getElementById('ordersTab').scrollIntoView({behavior:'smooth'})" title="Jump to the Cancelled view">⚠️ <b>${cancelN}</b>&nbsp;cancelled · <b>${fmt(cancelFees)}</b>&nbsp;fees to reclaim</span>`);
             if (refundN > 0) chips.push(`<span class="attn-chip attn-amber" onclick="setOrderView('refunded');document.getElementById('ordersTab').scrollIntoView({behavior:'smooth'})" title="Jump to the Refunded view">↩️ <b>${refundN}</b>&nbsp;refunded · −${fmt(refundLoss)} sourcing loss</span>`);
             if (holdN > 0) chips.push(`<span class="attn-chip attn-amber" onclick="setOrderView('hold');document.getElementById('ordersTab').scrollIntoView({behavior:'smooth'})" title="Dispatched on paper only — sale held back">⏸ <b>${holdN}</b>&nbsp;held · ${fmt(heldSales)} not counted</span>`);
+            if (missingCostN > 0) {
+                chips.push(`<span class="badge badge-warning" style="margin-left:8px">⚠️ <b>${missingCostN}</b> dispatched missing cost · ${fmt(missingCostSales)} unverified</span>`);
+            }
             const dedNote = (pct > 0 || expAll > 0) ? ` Net Profit is after sourcing fee ${pct}% (−${fmt(srcFee)})${expAll > 0 ? ` and expenses (−${fmt(expAll)})` : ''}.` : '';
             chips.push(`<span class="attn-chip attn-grey" title="Live totals across ALL orders in range — cancelled excluded, refunded counted as sourcing-cost loss.${dedNote}">ℹ️ ${infoNotes.length ? esc(infoNotes.join(' ')) : 'All orders in range'} · how totals work</span>`);
             notes.push(`<span class="attn-strip">${chips.join('')}</span>`);
@@ -2487,6 +2494,9 @@
             $('trackingInput').value = '';
             $('supplierOrderInput').value = '';
             $('dispatchHoldBox').checked = false;
+            const o = allOrders.find(x => x.id === id) || {};
+            const hasCost = Number(o.amount) > 0;
+            $('dispatchCostWarning').style.display = hasCost ? 'none' : 'block';
             document.querySelectorAll('#dispatchModal .courier').forEach(b => b.classList.remove('sel'));
             $('dispatchModal').classList.remove('hidden');
             setTimeout(() => $('trackingInput').focus(), 150);
