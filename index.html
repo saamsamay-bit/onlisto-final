@@ -2400,6 +2400,9 @@
             chips.push(`<span class="attn-chip attn-grey" title="Live totals across ALL orders in range — cancelled excluded, refunded counted as sourcing-cost loss.${dedNote}">ℹ️ ${infoNotes.length ? esc(infoNotes.join(' ')) : 'All orders in range'} · how totals work</span>`);
             notes.push(`<span class="attn-strip">${chips.join('')}</span>`);
             // --- VA splits (uses the % in the input boxes; shows the selected account's split too) ---
+            // Deduct each account's expenses before calculating the VA share.
+            pan -= expensesAllTime('panacea');
+            sam -= expensesAllTime('samayy');
             const panPct = (parseFloat($('panaceaPercent').value) || 30) / 100;
             const samPct = (parseFloat($('samayyPercent').value) || 20) / 100;
             const fl = f.toLowerCase();
