@@ -2510,6 +2510,13 @@
             if (!selectedCourier) return toast('Pick a courier first.', 'error');
             const tracking = $('trackingInput').value.trim();
             if (!tracking) return toast('Enter the tracking number.', 'error');
+            if (!$('dispatchHoldBox').checked) {
+                const o = allOrders.find(x => x.id === dispatchOrderId) || {};
+                if (Number(o.amount) <= 0) {
+                    alert("Enter sourcing cost first or tick 'No supplier yet' to hold.");
+                    return;
+                }
+            }
             try {
                 const supplierNo = $('supplierOrderInput').value.trim();
                 await updateDoc(doc(db, "orderTracker_orders", dispatchOrderId), {
