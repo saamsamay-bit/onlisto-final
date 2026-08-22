@@ -475,6 +475,7 @@
             </div>
             <input type="text" id="trackingInput" class="inp" placeholder="Tracking number">
             <input type="text" id="supplierOrderInput" class="inp" placeholder="Amazon/eBay order # (optional — e.g. 202-1234567-1234567)" style="margin-top:8px">
+            <label style="display:flex;gap:8px;align-items:center;margin:10px 0;cursor:pointer"><input type="checkbox" id="dispatchHoldBox"> <span>No supplier yet (hold sale)</span></label>
             <div class="modal-actions">
                 <button class="btn btn-ghost" onclick="closeModal('dispatchModal')">Cancel</button>
                 <button class="btn btn-success" onclick="confirmDispatch()">Confirm Dispatch</button>
@@ -1052,6 +1053,7 @@
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_dispatched" onclick="setOrderView('dispatched')">Dispatched</button>
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_cancelled" onclick="setOrderView('cancelled')">Cancelled</button>
                     <button class="btn btn-ghost btn-sm ord-view" id="ov_refunded" onclick="setOrderView('refunded')">Refunded</button>
+                    <button class="btn btn-ghost btn-sm ord-view" id="ov_hold" onclick="setOrderView('hold')">⏸ On Hold</button>
                     <span id="cancelStats" style="display:inline-flex;gap:6px;flex-wrap:wrap"></span>
                     <button class="btn btn-ghost btn-sm" onclick="runSupplierAudit()" title="Cross-check supplier order numbers vs Amazon / AliExpress / eBay confirmation emails">🔍 Audit</button>
                     <input type="text" id="orderSearchInput" class="inp" placeholder="Search order ID…" style="width:180px;margin-left:auto" onkeydown="if(event.key==='Enter')searchOrders()">
@@ -1335,9 +1337,9 @@
                         <p style="margin:10px 0 4px"><b>For EXISTING clients:</b> set up auto-forward from their Gmail:</p>
                         <ol>
                             <li>In the client's Gmail, open <b>Settings → Forwarding and POP/IMAP → Add a forwarding address</b>.</li>
-                            <li>Enter their dispute inbox: <code><a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="9efaf7edeeebeafbedb5fdf2f7fbf0eaf0fff3fbdef1f0f2f7edeaf1b0f7f1">[email&#160;protected]</a></code> and confirm the verification email (it arrives in your Onlisto inbox).</li>
-                            <li>Go to <b>Settings → Filters → Create a new filter</b>: in <b>From</b> put <code><a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="2b485e585f44464e59585e5b5b44595f064c496b4445495e5205484446">[email&#160;protected]</a></code>, in <b>Has the words</b> put <code>dispute OR chargeback OR escalation OR "we need your help"</code>.</li>
-                            <li>Click <b>Create filter</b> → tick <b>Forward it to:</b> and choose <code><a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="74101d0704010011075f17181d111a001a151911341b1a181d07001b5a1d1b">[email&#160;protected]</a></code> → <b>Create filter</b>.</li>
+                            <li>Enter their dispute inbox: <code>disputes+clientname@onlisto.io</code> and confirm the verification email (it arrives in your Onlisto inbox).</li>
+                            <li>Go to <b>Settings → Filters → Create a new filter</b>: in <b>From</b> put <code>customersupport-gb@onbuy.com</code>, in <b>Has the words</b> put <code>dispute OR chargeback OR escalation OR "we need your help"</code>.</li>
+                            <li>Click <b>Create filter</b> → tick <b>Forward it to:</b> and choose <code>disputes+clientname@onlisto.io</code> → <b>Create filter</b>.</li>
                         </ol>
                         <p style="margin:10px 0 0">The Cloud Function parser reads every forwarded email automatically: order ID, dispute reference, reason, deadline, fee amount and type are extracted and appear in the table above. When a real email arrives, the parser patterns are refined in one patch.</p>
                     </div>
@@ -1509,7 +1511,7 @@
         </section>
     </main>
 
-    <script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script type="module">
+    <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut }
             from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
@@ -1867,9 +1869,11 @@
             window._cancelReasonOrderId = orderId;
             window._cancelReasonConfirm = !!alsoConfirm;
             $('cancelReasonOrderNo').textContent = orderNo || orderId;
-            $('cancelReasonSel').value = '';
-            $('cancelReasonNote').value = '';
-            $('cancelReasonOtherWrap').style.display = 'none';
+            // Pre-fill with any reason already saved, so Confirm never asks twice
+            const existing = (typeof allOrders !== 'undefined' ? allOrders : []).find(o => o.id === orderId);
+            $('cancelReasonSel').value = (existing && existing.cancelReason) || '';
+            $('cancelReasonNote').value = (existing && existing.cancelReasonNote) || '';
+            $('cancelReasonOtherWrap').style.display = ($('cancelReasonSel').value === 'other') ? '' : 'none';
             $('cancelReasonModal').classList.remove('hidden');
         };
         window.cancelReasonSelChange = function() {
@@ -2009,6 +2013,7 @@
             const ob = (o.onbuyStatus || '').toLowerCase();
             if (s === 'Cancelled' || !!o.onbuyCancellation || ob.includes('cancel')) return 'cancelled';
             if (s === 'Refunded' || !!o.onbuyRefunds || ob.includes('refund')) return 'refunded';
+            if (o.dispatchHold === true) return 'hold';
             if (s === 'Dispatched' || o.dispatchedToOnbuy === true) return 'dispatched';
             return 'pending';
         };
@@ -2127,6 +2132,13 @@
                     statusHtml = `<span class="badge" style="background:#fff7ed;color:#c2410c;border:1px solid #fdba74">Refunded</span><br>
                        ${rfTotal ? `<span class="small" style="color:#c2410c;font-weight:800">−${fmt(rfTotal)}</span><br>` : ''}
                        <span class="small muted">${o.refundAt ? fmtTs(o.refundAt) : ''}</span>`;
+                } else if (oState === 'hold') {
+                    const heldDays = o.dispatchedAt && o.dispatchedAt.toDate ? Math.floor((Date.now() - o.dispatchedAt.toDate().getTime()) / 86400000) : 0;
+                    const ono2 = esc(o.orderNo || o.onbuyOrderId || o.id);
+                    statusHtml = `<span class="badge" style="background:#fef3c7;color:#92400e;border:1px solid #f59e0b">⏸ On Hold</span>${heldDays >= 3 ? ` <span class="badge badge-danger">${heldDays}d — decide!</span>` : ''}<br>
+                       <span class="small muted">Dispatched on paper — sale not counted</span><br>
+                       <button onclick="fulfillHold('${o.id}')" class="btn btn-success btn-sm" style="margin-top:6px">✅ Fulfilled</button>
+                       <button onclick="openCancelReason('${o.id}','${ono2}',true)" class="btn btn-danger btn-sm" style="margin-top:6px;margin-left:4px">Cancel</button>`;
                 } else if (dispatched) {
                     statusHtml = `<span class="badge badge-success">Dispatched</span><br>
                        <span class="small" style="font-weight:800;color:var(--ink)">${esc(o.trackingCarrier || '')}</span><br>
@@ -2194,7 +2206,9 @@
                             ? 'Profit: <b>—</b> <span class="badge badge-danger">cancelled — not counted</span>'
                             : oState === 'refunded'
                                 ? `Loss: <b style="color:var(--red)">−${fmt(cost)}</b> <span class="badge" style="background:#fff7ed;color:#c2410c;border:1px solid #fdba74">refunded</span>`
-                                : `Profit: <b style="color:${pColor}">${fmt(profit)}</b> ${lockIc} ${pBadge}${cost === 0 ? ' <span class="badge badge-warning">no cost set</span>' : ''}`}</div>
+                                : oState === 'hold'
+                                    ? 'On hold — not counted (no profit figure)'
+                                    : `Profit: <b style="color:${pColor}">${fmt(profit)}</b> ${lockIc} ${pBadge}${cost === 0 ? ' <span class="badge badge-warning">no cost set</span>' : ''}`}</div>
                     </td>
                     <td>${contactHtml}</td>
                     <td style="min-width:140px">${statusHtml}</td>
@@ -2335,7 +2349,7 @@
                 if (pnlPage.size < 5000) break;
                 pnlLast = pnlPage.docs[pnlPage.docs.length - 1];
             }
-            let s = 0, c = 0, f2 = 0, refundLoss = 0, cancelFees = 0, cancelN = 0, refundN = 0;
+            let s = 0, c = 0, f2 = 0, refundLoss = 0, cancelFees = 0, cancelN = 0, refundN = 0, holdN = 0, heldSales = 0;
             let pan = 0, sam = 0;
             const zeroCost = [];   // dispatched/active orders with no sourcing cost on record — profit inflated
             pnlDocs.forEach(d => {
@@ -2350,6 +2364,8 @@
                     if (o.team === 'panacea') pan -= cost; else if (o.team === 'samayy') sam -= cost;
                     return;
                 }
+                if (st === 'hold') { holdN++; heldSales += sale; return; }
+                if (st === 'pending') { return; }
                 if (cost === 0 && sale > 0) zeroCost.push({ n: o.orderNo || d.id, sale });
                 s += sale; c += cost; f2 += fee;
                 if (o.team === 'panacea') pan += sale - fee - cost;
@@ -2371,6 +2387,7 @@
             }
             if (cancelN > 0) chips.push(`<span class="attn-chip attn-amber" onclick="setOrderView('cancelled');document.getElementById('ordersTab').scrollIntoView({behavior:'smooth'})" title="Jump to the Cancelled view">⚠️ <b>${cancelN}</b>&nbsp;cancelled · <b>${fmt(cancelFees)}</b>&nbsp;fees to reclaim</span>`);
             if (refundN > 0) chips.push(`<span class="attn-chip attn-amber" onclick="setOrderView('refunded');document.getElementById('ordersTab').scrollIntoView({behavior:'smooth'})" title="Jump to the Refunded view">↩️ <b>${refundN}</b>&nbsp;refunded · −${fmt(refundLoss)} sourcing loss</span>`);
+            if (holdN > 0) chips.push(`<span class="attn-chip attn-amber" onclick="setOrderView('hold');document.getElementById('ordersTab').scrollIntoView({behavior:'smooth'})" title="Dispatched on paper only — sale held back">⏸ <b>${holdN}</b>&nbsp;held · ${fmt(heldSales)} not counted</span>`);
             const dedNote = (pct > 0 || expAll > 0) ? ` Net Profit is after sourcing fee ${pct}% (−${fmt(srcFee)})${expAll > 0 ? ` and expenses (−${fmt(expAll)})` : ''}.` : '';
             chips.push(`<span class="attn-chip attn-grey" title="Live totals across ALL orders in range — cancelled excluded, refunded counted as sourcing-cost loss.${dedNote}">ℹ️ ${infoNotes.length ? esc(infoNotes.join(' ')) : 'All orders in range'} · how totals work</span>`);
             notes.push(`<span class="attn-strip">${chips.join('')}</span>`);
@@ -2408,12 +2425,19 @@
                 const encLink = cleaned.cleanUrl ? await encryptText(cleaned.cleanUrl) : '';
                 if (encLink.startsWith(ENC_PREFIX)) decCache.set(encLink, cleaned.cleanUrl);
                 await updateDoc(doc(db, "orderTracker_orders", id), {
-                    sourceLink: encLink, sourcePlatform: cleaned.platform || '', amount: cost
+                    sourceLink: encLink, sourcePlatform: cleaned.platform || '', amount: cost, dispatchHold: false
                 });
                 toast(cleaned.platform && cleaned.platform !== 'Other'
                     ? `Saved — ${cleaned.platform} link cleaned, encrypted & profit recalculated.`
                     : 'Order updated — profit recalculated.', 'success');
             } catch (e) { toast('Update failed: ' + e.message, 'error'); }
+        };
+        window.fulfillHold = async function(id) {
+            const costEl = $('order-cost-' + id);
+            const cost = costEl ? Number(costEl.value) : 0;
+            if (!cost || cost <= 0) { toast('Enter the sourcing cost first, then click Fulfilled.', 'error'); costEl && costEl.focus(); return; }
+            await updateOrderSourcing(id);
+            toast('Fulfilled — now counted as a real sale.', 'success');
         };
 
         /* ================= ORDER NOTES ================= */
@@ -2449,6 +2473,7 @@
             dispatchOrderId = id; selectedCourier = '';
             $('trackingInput').value = '';
             $('supplierOrderInput').value = '';
+            $('dispatchHoldBox').checked = false;
             document.querySelectorAll('#dispatchModal .courier').forEach(b => b.classList.remove('sel'));
             $('dispatchModal').classList.remove('hidden');
             setTimeout(() => $('trackingInput').focus(), 150);
@@ -2468,7 +2493,7 @@
                     status: 'Dispatched', dispatchedToOnbuy: true,
                     trackingCarrier: selectedCourier, trackingNumber: tracking,
                     ...(supplierNo ? { sourceOrderNo: supplierNo } : {}),
-                    dispatchedAt: serverTimestamp()
+                    dispatchedAt: serverTimestamp(), dispatchHold: $('dispatchHoldBox').checked
                 });
                 closeModal('dispatchModal');
                 toast(`Dispatched via ${selectedCourier}.`, 'success');
